@@ -1,0 +1,19 @@
+{
+  "agreementId": "AGR-2026-018",
+  "parties": [{"id": "PTY-A", "name": "甲方"}, {"id": "PTY-B", "name": "乙方"}],
+  "clauses": [
+    {"id": "CL-01", "obligor": "PTY-A", "amountFen": 120000, "due": "2026-09-01"},
+    {"id": "CL-02", "obligor": "PTY-B", "references": ["CL-01"], "due": "2026-08-15"}
+  ],
+  "amendments": [
+    {"id": "AMD-01", "replaces": "CL-01", "newClauseId": "CL-01-R1", "amountFen": 100000, "due": "2026-09-15"},
+    {"id": "AMD-BAD", "replaces": "CL-404", "newClauseId": "CL-X"}
+  ],
+  "signatures": [
+    {"partyId": "PTY-A", "scope": ["AGR-2026-018", "AMD-01"], "signedAt": "2026-08-01T10:00:00Z"},
+    {"partyId": "PTY-B", "scope": ["AGR-2026-018"], "signedAt": "2026-08-01T10:02:00Z"}
+  ],
+  "evidencePathFormat": "$.clauses[<index>].<field>",
+  "requiredChecks": ["unknown references", "amendment replacement", "signature scope", "amount consistency", "date order", "reference cycles"]
+}
+
