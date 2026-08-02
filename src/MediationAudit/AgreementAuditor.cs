@@ -74,6 +74,9 @@ public static class MediationIssueCodes
     /// <summary>The clause reference graph contains a directed cycle.</summary>
     public const string ReferenceCycle = "MED_REFERENCE_CYCLE";
 
+    /// <summary>The amendment replacement (version) graph contains a directed cycle.</summary>
+    public const string ReplacementCycle = "MED_REPLACEMENT_CYCLE";
+
     /// <summary>A withdrawn amendment is still referenced by a signature scope or a live clause.</summary>
     public const string WithdrawnAmendmentReferenced = "MED_WITHDRAWN_AMENDMENT_REFERENCED";
 }
@@ -141,6 +144,125 @@ public sealed record Signature(
 /// <param name="AmountFen">Effective amount in fen, if known.</param>
 /// <param name="Due">Effective due date, if known.</param>
 public sealed record Obligation(string ClauseId, string? Obligor, long? AmountFen, DateTimeOffset? Due);
+
+/// <summary>
+/// How a version-chain edge came to exist. Both kinds are retained in the audit graph; the
+/// distinction is informational because the auditable history must never physically drop a clause.
+/// </summary>
+public enum RevisionKind
+{
+    /// <summary>The amendment replaces an existing clause version (<c>replaces</c> targets a known clause).</summary>
+    Replacement = 0,
+
+    /// <summary>The amendment appends a brand-new clause version (<c>replaces</c> is absent or empty).</summary>
+    Append = 1,
+}
+
+/// <summary>
+/// A node in the auditable clause version graph: one concrete clause version. A node exists for
+/// every original clause and for every clause id introduced by an amendment; nothing is deleted, so
+/// superseded versions remain queryable for history.
+/// </summary>
+public sealed class ClauseVersionNode
+{
+    internal ClauseVersionNode(string clauseId, bool isOriginal, int? clauseSourceIndex, int? amendmentSourceIndex)
+    {
+        ClauseId = clauseId;
+        IsOriginal = isOriginal;
+        ClauseSourceIndex = clauseSourceIndex;
+        AmendmentSourceIndex = amendmentSourceIndex;
+    }
+
+    /// <summary>The clause id this version carries (reused verbatim from round 1).</summary>
+    public string ClauseId { get; }
+
+    /// <summary>True when this version came from the original <c>$.clauses</c> array.</summary>
+    public bool IsOriginal { get; }
+
+    /// <summary>Index in <c>$.clauses</c> when the version originates there; otherwise <c>null</c>.</summary>
+    public int? ClauseSourceIndex { get; }
+
+    /// <summary>Index in <c>$.amendments</c> of the amendment that introduced this version; <c>null</c> for originals.</summary>
+    public int? AmendmentSourceIndex { get; }
+
+    /// <summary>True when a live amendment replaces this version, so it is no longer a tip of its chain.</summary>
+    public bool IsSuperseded { get; internal set; }
+}
+
+/// <summary>
+/// A directed edge in the version graph: an amendment that turns the <see cref="FromClauseId"/>
+/// version into the <see cref="ToClauseId"/> version. Edges are keyed by the amendment so evidence
+/// paths always point back to the originating <c>$.amendments[i]</c> entry.
+/// </summary>
+public sealed class ClauseVersionEdge
+{
+    internal ClauseVersionEdge(
+        string amendmentId,
+        string? fromClauseId,
+        string toClauseId,
+        RevisionKind kind,
+        int amendmentSourceIndex)
+    {
+        AmendmentId = amendmentId;
+        FromClauseId = fromClauseId;
+        ToClauseId = toClauseId;
+        Kind = kind;
+        AmendmentSourceIndex = amendmentSourceIndex;
+    }
+
+    /// <summary>Id of the amendment that created this edge.</summary>
+    public string AmendmentId { get; }
+
+    /// <summary>The clause id being revised, or <c>null</c> for an append.</summary>
+    public string? FromClauseId { get; }
+
+    /// <summary>The clause id produced by this revision.</summary>
+    public string ToClauseId { get; }
+
+    /// <summary>Whether the edge is a replacement or an append.</summary>
+    public RevisionKind Kind { get; }
+
+    /// <summary>Index of the amendment in the original <c>$.amendments</c> array.</summary>
+    public int AmendmentSourceIndex { get; }
+
+    /// <summary>Evidence path anchored on the amendment's <c>replaces</c> (or the amendment element for appends).</summary>
+    public string EvidencePath => Kind == RevisionKind.Replacement
+        ? $"$.amendments[{AmendmentSourceIndex}].replaces"
+        : $"$.amendments[{AmendmentSourceIndex}]";
+}
+
+/// <summary>
+/// The auditable directed version chain built from the clauses and their amendments. The chain is
+/// insensitive to the order of the <c>$.amendments</c> array: nodes, edges and the effective view
+/// are all derived from clause ids, and any position-sensitive choice (such as which of two
+/// concurrent replacements "wins") is resolved by the smallest amendment id, never by array index.
+/// </summary>
+public sealed class ClauseVersionChain
+{
+    internal ClauseVersionChain(
+        IReadOnlyList<ClauseVersionNode> nodes,
+        IReadOnlyList<ClauseVersionEdge> edges,
+        IReadOnlyList<ClauseVersionNode> effectiveVersions)
+    {
+        Nodes = nodes;
+        Edges = edges;
+        EffectiveVersions = effectiveVersions;
+    }
+
+    /// <summary>Every clause version, in ascending clause-id order. Superseded versions are retained.</summary>
+    public IReadOnlyList<ClauseVersionNode> Nodes { get; }
+
+    /// <summary>Every revision edge, in ascending (amendment-id) order.</summary>
+    public IReadOnlyList<ClauseVersionEdge> Edges { get; }
+
+    /// <summary>The current, non-superseded clause versions, in ascending clause-id order.</summary>
+    public IReadOnlyList<ClauseVersionNode> EffectiveVersions { get; }
+
+    /// <summary>Returns the effective clause ids as a stable, ascending list (a canonical view for comparison).</summary>
+    /// <returns>The non-superseded clause ids in ordinal order.</returns>
+    public IReadOnlyList<string> EffectiveClauseIds() =>
+        EffectiveVersions.Select(n => n.ClauseId).OrderBy(id => id, StringComparer.Ordinal).ToList();
+}
 
 /// <summary>
 /// A parsed mediation agreement package: the root aggregate the auditor operates on. Element order
@@ -212,7 +334,8 @@ public sealed class AuditIssue
         EvidenceScope scope,
         int primaryIndex,
         int secondaryIndex,
-        string field)
+        string field,
+        string sortKey)
     {
         Code = code;
         Severity = severity;
@@ -222,6 +345,7 @@ public sealed class AuditIssue
         PrimaryIndex = primaryIndex;
         SecondaryIndex = secondaryIndex;
         Field = field;
+        SortKey = sortKey;
     }
 
     /// <summary>Stable issue code (always <c>MED_</c>-prefixed).</summary>
@@ -247,6 +371,14 @@ public sealed class AuditIssue
 
     /// <summary>Field name the evidence path terminates in (may be empty for element-level paths).</summary>
     public string Field { get; }
+
+    /// <summary>
+    /// A position-independent ordering key built only from logical identifiers (clause ids,
+    /// amendment ids, party ids). Two audits of the same package produce identical sort keys even if
+    /// the <c>$.amendments</c> array (or any field) is reordered, because the key never encodes a
+    /// physical array index or the display message.
+    /// </summary>
+    public string SortKey { get; }
 
     /// <summary>Returns a compact, deterministic string representation.</summary>
     /// <returns>A string of the form <c>CODE [Severity] path — message</c>.</returns>
@@ -386,10 +518,11 @@ public sealed class AgreementAuditor
         foreach (var clause in agreement.Clauses)
             clauseById[clause.Id] = clause;
 
-        // Map each replaced clause id to the winning live amendment (lowest source index wins so the
-        // result is independent of amendment ordering in the file).
+        // Map each replaced clause id to the winning live amendment. The smallest amendment id wins
+        // (a logical, position-independent tie-break) so the effective view is identical no matter
+        // how the $.amendments array happens to be ordered.
         var winningAmendment = new Dictionary<string, Amendment>(StringComparer.Ordinal);
-        foreach (var amendment in agreement.Amendments.OrderBy(a => a.SourceIndex))
+        foreach (var amendment in agreement.Amendments.OrderBy(a => a.Id, StringComparer.Ordinal))
         {
             if (amendment.Withdrawn) continue;
             if (amendment.Replaces is null || !clauseById.ContainsKey(amendment.Replaces)) continue;
@@ -442,6 +575,7 @@ public sealed class AgreementAuditor
 
         CheckAmendmentTargets(agreement, knownClauseIds, issues, out var validLiveAmendments);
         CheckDuplicateReplacements(validLiveAmendments, issues);
+        CheckReplacementCycles(agreement, knownClauseIds, issues);
         CheckUnknownReferences(agreement, knownClauseIds, issues);
         CheckReferenceCycles(agreement, clauseById, issues);
         CheckDateOrder(agreement, clauseById, issues);
@@ -450,6 +584,75 @@ public sealed class AgreementAuditor
 
         issues.Sort(CompareIssues);
         return new AuditResult(issues);
+    }
+
+    /// <summary>
+    /// Builds the auditable directed clause-version chain from the package's clauses and amendments.
+    /// The result is independent of the order of the <c>$.amendments</c> array: every original clause
+    /// and every amendment-introduced clause id becomes a retained node (nothing is deleted), each
+    /// live replacement/append becomes an edge, and a version is marked superseded only when a live
+    /// amendment whose target exists replaces it. When two concurrent live amendments replace the same
+    /// clause, the smallest amendment id is treated as the effective successor so the effective view
+    /// never depends on array position.
+    /// </summary>
+    /// <param name="agreement">The agreement package.</param>
+    /// <returns>The <see cref="ClauseVersionChain"/> describing versions, edges and the effective view.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="agreement"/> is null.</exception>
+    public ClauseVersionChain BuildVersionChain(MediationAgreement agreement)
+    {
+        if (agreement is null) throw new ArgumentNullException(nameof(agreement));
+
+        // Nodes: original clauses first, then amendment-introduced clause ids. Original wins the
+        // provenance when a clause id happens to collide with an amendment's new id.
+        var nodesById = new Dictionary<string, ClauseVersionNode>(StringComparer.Ordinal);
+        foreach (var clause in agreement.Clauses)
+            if (!nodesById.ContainsKey(clause.Id))
+                nodesById[clause.Id] = new ClauseVersionNode(clause.Id, isOriginal: true, clause.SourceIndex, null);
+
+        foreach (var amendment in agreement.Amendments.OrderBy(a => a.Id, StringComparer.Ordinal))
+            if (!string.IsNullOrEmpty(amendment.NewClauseId) && !nodesById.ContainsKey(amendment.NewClauseId!))
+                nodesById[amendment.NewClauseId!] =
+                    new ClauseVersionNode(amendment.NewClauseId!, isOriginal: false, null, amendment.SourceIndex);
+
+        // Edges: one per live amendment. A replacement supersedes its target; an append introduces a
+        // fresh version with no predecessor. Concurrent replacements of the same clause all become
+        // edges (the fork is preserved for the audit), but only the smallest-id amendment supersedes
+        // the shared parent, keeping the effective view position-independent.
+        var edges = new List<ClauseVersionEdge>();
+        var supersededBy = new Dictionary<string, string>(StringComparer.Ordinal); // parent id -> winning amendment id
+        foreach (var amendment in agreement.Amendments.OrderBy(a => a.Id, StringComparer.Ordinal))
+        {
+            if (amendment.Withdrawn) continue;
+            if (string.IsNullOrEmpty(amendment.NewClauseId)) continue;
+
+            bool isReplacement = amendment.Replaces is not null && nodesById.ContainsKey(amendment.Replaces);
+            if (isReplacement)
+            {
+                edges.Add(new ClauseVersionEdge(
+                    amendment.Id, amendment.Replaces, amendment.NewClauseId!, RevisionKind.Replacement, amendment.SourceIndex));
+                if (!supersededBy.ContainsKey(amendment.Replaces!))
+                    supersededBy[amendment.Replaces!] = amendment.Id;
+            }
+            else if (amendment.Replaces is null)
+            {
+                edges.Add(new ClauseVersionEdge(
+                    amendment.Id, null, amendment.NewClauseId!, RevisionKind.Append, amendment.SourceIndex));
+            }
+            // A replacement whose target is unknown is reported elsewhere and produces no edge.
+        }
+
+        foreach (var parentId in supersededBy.Keys)
+            if (nodesById.TryGetValue(parentId, out var node))
+                node.IsSuperseded = true;
+
+        var orderedNodes = nodesById.Values.OrderBy(n => n.ClauseId, StringComparer.Ordinal).ToList();
+        var effective = orderedNodes.Where(n => !n.IsSuperseded).ToList();
+        var orderedEdges = edges
+            .OrderBy(e => e.AmendmentId, StringComparer.Ordinal)
+            .ThenBy(e => e.ToClauseId, StringComparer.Ordinal)
+            .ToList();
+
+        return new ClauseVersionChain(orderedNodes, orderedEdges, effective);
     }
 
     // ----- individual checks -------------------------------------------------------------------
@@ -476,7 +679,8 @@ public sealed class AgreementAuditor
                     EvidenceScope.Amendments,
                     amendment.SourceIndex,
                     -1,
-                    "replaces"));
+                    "replaces",
+                    $"AMD:{amendment.Id}"));
                 continue;
             }
 
@@ -492,11 +696,13 @@ public sealed class AgreementAuditor
 
         foreach (var group in groups)
         {
-            var ordered = group.OrderBy(a => a.SourceIndex).ToList();
+            // Order competing amendments by id (not by array position) so the baseline "winner" and
+            // every reported duplicate are the same regardless of how the amendments array is ordered.
+            var ordered = group.OrderBy(a => a.Id, StringComparer.Ordinal).ToList();
             if (ordered.Count < 2) continue;
 
             var baseline = ordered[0];
-            // Every amendment after the earliest one is a structurally ambiguous replacement.
+            // Every amendment other than the smallest-id one is a structurally ambiguous replacement.
             foreach (var amendment in ordered.Skip(1))
             {
                 issues.Add(new AuditIssue(
@@ -507,7 +713,8 @@ public sealed class AgreementAuditor
                     EvidenceScope.Amendments,
                     amendment.SourceIndex,
                     -1,
-                    "replaces"));
+                    "replaces",
+                    $"{amendment.Replaces}\u0000AMD:{amendment.Id}"));
 
                 // A monetary conflict among the competing replacements is called out separately.
                 if (amendment.AmountFen.HasValue && baseline.AmountFen.HasValue
@@ -521,9 +728,67 @@ public sealed class AgreementAuditor
                         EvidenceScope.Amendments,
                         amendment.SourceIndex,
                         -1,
-                        "amountFen"));
+                        "amountFen",
+                        $"{amendment.Replaces}\u0000AMD:{amendment.Id}"));
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Detects directed cycles in the amendment replacement (version) graph, where each live
+    /// amendment draws an edge from its <c>newClauseId</c> to the clause it <c>replaces</c>. A cycle
+    /// means the version history folds back on itself (for example CL-A is replaced by CL-B while
+    /// CL-B is replaced back into CL-A). The evidence is the single shortest anchor: the
+    /// <c>replaces</c> field of the smallest-id amendment participating in the cycle.
+    /// </summary>
+    private static void CheckReplacementCycles(
+        MediationAgreement agreement,
+        HashSet<string> knownClauseIds,
+        List<AuditIssue> issues)
+    {
+        // Edge: newClauseId -> replaces, for live amendments whose endpoints are both known clause ids.
+        // Keep, per source node, the smallest-id amendment so the reported evidence is canonical.
+        var amendmentByEdge = new Dictionary<string, Amendment>(StringComparer.Ordinal);
+        foreach (var amendment in agreement.Amendments.OrderBy(a => a.Id, StringComparer.Ordinal))
+        {
+            if (amendment.Withdrawn) continue;
+            if (string.IsNullOrEmpty(amendment.NewClauseId) || amendment.Replaces is null) continue;
+            if (!knownClauseIds.Contains(amendment.NewClauseId!) || !knownClauseIds.Contains(amendment.Replaces)) continue;
+            if (!amendmentByEdge.ContainsKey(amendment.NewClauseId!))
+                amendmentByEdge[amendment.NewClauseId!] = amendment;
+        }
+
+        var cycles = StronglyConnectedComponents.FindCycles(
+            nodeIds: amendmentByEdge.Keys
+                .Concat(amendmentByEdge.Values.Select(a => a.Replaces!))
+                .Distinct(StringComparer.Ordinal),
+            edgesFrom: node => amendmentByEdge.TryGetValue(node, out var amendment)
+                ? new[] { amendment.Replaces! }
+                : Array.Empty<string>());
+
+        foreach (var component in cycles)
+        {
+            // The amendments forming the cycle are those whose source node is in the component.
+            var cycleAmendments = component
+                .Where(node => amendmentByEdge.ContainsKey(node))
+                .Select(node => amendmentByEdge[node])
+                .OrderBy(a => a.Id, StringComparer.Ordinal)
+                .ToList();
+            if (cycleAmendments.Count == 0) continue;
+
+            var canonical = cycleAmendments[0];
+            var members = component.OrderBy(id => id, StringComparer.Ordinal);
+            issues.Add(new AuditIssue(
+                MediationIssueCodes.ReplacementCycle,
+                Severity.Error,
+                $"Amendment replacement cycle detected among clauses: {string.Join(", ", members)}.",
+                $"$.amendments[{canonical.SourceIndex}].replaces",
+                EvidenceScope.Amendments,
+                canonical.SourceIndex,
+                -1,
+                "replaces",
+                $"AMD:{canonical.Id}"));
         }
     }
 
@@ -547,7 +812,8 @@ public sealed class AgreementAuditor
                         EvidenceScope.Clauses,
                         clause.SourceIndex,
                         j,
-                        "references"));
+                        "references",
+                        $"{clause.Id}\u0000{target}"));
                 }
             }
         }
@@ -577,7 +843,8 @@ public sealed class AgreementAuditor
                         EvidenceScope.Clauses,
                         clause.SourceIndex,
                         j,
-                        "references"));
+                        "references",
+                        $"{clause.Id}\u0000{prerequisite.Id}"));
                 }
             }
         }
@@ -588,11 +855,13 @@ public sealed class AgreementAuditor
         List<Amendment> validLiveAmendments,
         List<AuditIssue> issues)
     {
-        // Signable ids: the base agreement plus every valid live amendment.
+        // Signable ids: the base agreement plus every valid live amendment, in stable id order so the
+        // "missing" message text does not depend on the amendments array order.
         var signables = new List<string> { agreement.AgreementId };
-        signables.AddRange(validLiveAmendments.Select(a => a.Id));
+        signables.AddRange(validLiveAmendments.Select(a => a.Id).OrderBy(id => id, StringComparer.Ordinal));
 
-        // First signature per party (lowest source index) carries the coverage evidence.
+        // The lowest-index signature per party carries the coverage evidence; coverage itself is a
+        // set union, so it is independent of signature order.
         var firstSignatureByParty = new Dictionary<string, Signature>(StringComparer.Ordinal);
         var coverageByParty = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         foreach (var signature in agreement.Signatures.OrderBy(s => s.SourceIndex))
@@ -624,7 +893,8 @@ public sealed class AgreementAuditor
                     EvidenceScope.Signatures,
                     signature.SourceIndex,
                     -1,
-                    "scope"));
+                    "scope",
+                    $"PTY:{party.Id}"));
             }
             else
             {
@@ -637,7 +907,8 @@ public sealed class AgreementAuditor
                     EvidenceScope.Parties,
                     party.SourceIndex,
                     -1,
-                    "id"));
+                    "id",
+                    $"PTY:{party.Id}"));
             }
         }
     }
@@ -674,7 +945,8 @@ public sealed class AgreementAuditor
                         EvidenceScope.Signatures,
                         signature.SourceIndex,
                         j,
-                        "scope"));
+                        "scope",
+                        $"SIG:{signature.PartyId}\u0000{signature.Scope[j]}"));
                 }
             }
         }
@@ -694,7 +966,8 @@ public sealed class AgreementAuditor
                         EvidenceScope.Clauses,
                         clause.SourceIndex,
                         j,
-                        "references"));
+                        "references",
+                        $"{clause.Id}\u0000{clause.References[j]}"));
                 }
             }
         }
@@ -707,114 +980,20 @@ public sealed class AgreementAuditor
         Dictionary<string, Clause> clauseById,
         List<AuditIssue> issues)
     {
-        // Build the directed graph over existing clause ids only. Nodes are indexed by their
-        // position in a stable id-sorted list so the algorithm is deterministic.
-        var nodeIds = clauseById.Keys.OrderBy(id => id, StringComparer.Ordinal).ToList();
-        int n = nodeIds.Count;
-        var idToNode = new Dictionary<string, int>(StringComparer.Ordinal);
-        for (int i = 0; i < n; i++) idToNode[nodeIds[i]] = i;
+        // Edges point from a clause to each existing clause it references. Cycle detection uses the
+        // iterative SCC helper so arbitrarily deep chains never touch the call stack.
+        var cycles = StronglyConnectedComponents.FindCycles(
+            nodeIds: clauseById.Keys,
+            edgesFrom: node => clauseById.TryGetValue(node, out var clause)
+                ? clause.References.Where(clauseById.ContainsKey)
+                : Enumerable.Empty<string>());
 
-        var adjacency = new List<int>[n];
-        var selfLoop = new bool[n];
-        for (int i = 0; i < n; i++)
+        foreach (var component in cycles)
         {
-            adjacency[i] = new List<int>();
-            var clause = clauseById[nodeIds[i]];
-            foreach (var reference in clause.References)
-            {
-                if (idToNode.TryGetValue(reference, out int target))
-                {
-                    if (target == i) selfLoop[i] = true;
-                    adjacency[i].Add(target);
-                }
-            }
-        }
-
-        // Iterative Tarjan's strongly-connected-components algorithm: an explicit work stack keeps
-        // arbitrarily deep reference chains off the call stack.
-        var indexOf = new int[n];
-        var lowLink = new int[n];
-        var onStack = new bool[n];
-        var visited = new bool[n];
-        for (int i = 0; i < n; i++) indexOf[i] = -1;
-
-        var sccStack = new Stack<int>();
-        int nextIndex = 0;
-
-        var sccs = new List<List<int>>();
-
-        for (int start = 0; start < n; start++)
-        {
-            if (visited[start]) continue;
-
-            // Each work-stack frame tracks a node and the next adjacency slot to explore.
-            var work = new Stack<(int node, int next)>();
-            work.Push((start, 0));
-
-            while (work.Count > 0)
-            {
-                var (v, next) = work.Pop();
-
-                if (next == 0)
-                {
-                    visited[v] = true;
-                    indexOf[v] = lowLink[v] = nextIndex++;
-                    sccStack.Push(v);
-                    onStack[v] = true;
-                }
-
-                bool pushedChild = false;
-                for (int k = next; k < adjacency[v].Count; k++)
-                {
-                    int w = adjacency[v][k];
-                    if (indexOf[w] == -1)
-                    {
-                        // Resume v at k+1 after w is fully processed, then descend into w.
-                        work.Push((v, k + 1));
-                        work.Push((w, 0));
-                        pushedChild = true;
-                        break;
-                    }
-                    else if (onStack[w])
-                    {
-                        if (indexOf[w] < lowLink[v]) lowLink[v] = indexOf[w];
-                    }
-                }
-
-                if (pushedChild) continue;
-
-                // v is fully explored: propagate low-links to the parent and close SCCs at roots.
-                if (lowLink[v] == indexOf[v])
-                {
-                    var component = new List<int>();
-                    int w;
-                    do
-                    {
-                        w = sccStack.Pop();
-                        onStack[w] = false;
-                        component.Add(w);
-                    } while (w != v);
-                    sccs.Add(component);
-                }
-
-                if (work.Count > 0)
-                {
-                    var parent = work.Peek();
-                    if (lowLink[v] < lowLink[parent.node]) lowLink[parent.node] = lowLink[v];
-                }
-            }
-        }
-
-        foreach (var component in sccs)
-        {
-            bool isCycle = component.Count > 1 || (component.Count == 1 && selfLoop[component[0]]);
-            if (!isCycle) continue;
-
-            // Canonical representative: the lowest clause id in the cycle, so the emitted issue is
-            // independent of the order SCCs were discovered in.
-            int repNode = component.OrderBy(node => nodeIds[node], StringComparer.Ordinal).First();
-            var members = component.Select(node => nodeIds[node]).OrderBy(id => id, StringComparer.Ordinal);
-            var repClause = clauseById[nodeIds[repNode]];
+            // Canonical representative: the lowest clause id in the cycle, so the emitted issue and
+            // its shortest evidence path are independent of the order SCCs were discovered in.
+            var members = component.OrderBy(id => id, StringComparer.Ordinal).ToList();
+            var repClause = clauseById[members[0]];
 
             issues.Add(new AuditIssue(
                 MediationIssueCodes.ReferenceCycle,
@@ -824,31 +1003,25 @@ public sealed class AgreementAuditor
                 EvidenceScope.Clauses,
                 repClause.SourceIndex,
                 -1,
-                "references"));
+                "references",
+                $"{repClause.Id}"));
         }
     }
 
     // ----- deterministic ordering --------------------------------------------------------------
 
     /// <summary>
-    /// Orders issues purely by their stable identity: issue code, then evidence scope, primary
-    /// index, secondary index and field. Message text and discovery/traversal order are never
-    /// consulted, so the ordering is reproducible for identical (even reordered) inputs.
+    /// Orders issues purely by their stable identity: the issue code first, then the
+    /// position-independent <see cref="AuditIssue.SortKey"/>. Neither physical array indices,
+    /// evidence-path text, nor the display message are consulted, so swapping the order of the
+    /// <c>$.amendments</c> array (or any other reordering of the same package) yields an identical
+    /// issue sequence.
     /// </summary>
     private static int CompareIssues(AuditIssue a, AuditIssue b)
     {
         int c = string.CompareOrdinal(a.Code, b.Code);
         if (c != 0) return c;
-        c = ((int)a.Scope).CompareTo((int)b.Scope);
-        if (c != 0) return c;
-        c = a.PrimaryIndex.CompareTo(b.PrimaryIndex);
-        if (c != 0) return c;
-        c = a.SecondaryIndex.CompareTo(b.SecondaryIndex);
-        if (c != 0) return c;
-        c = string.CompareOrdinal(a.Field, b.Field);
-        if (c != 0) return c;
-        // Final tie-breaker keeps ordering total even if two findings share a location.
-        return string.CompareOrdinal(a.Message, b.Message);
+        return string.CompareOrdinal(a.SortKey, b.SortKey);
     }
 
     // ----- JSON helpers ------------------------------------------------------------------------
@@ -913,6 +1086,129 @@ public sealed class AgreementAuditor
 }
 
 /// <summary>
+/// Iterative strongly-connected-components (Tarjan) used for every cycle check. The algorithm keeps
+/// its own explicit work stack, so it detects cycles in graphs with arbitrarily deep chains without
+/// ever risking a stack overflow. Node identity is a string id; the caller supplies the successor
+/// function. Results are deterministic: nodes are processed in ordinal id order.
+/// </summary>
+internal static class StronglyConnectedComponents
+{
+    /// <summary>
+    /// Returns every non-trivial cycle (each strongly connected component of size &gt; 1, plus any
+    /// single node that references itself). Each cycle is returned as the set of node ids it contains.
+    /// </summary>
+    /// <param name="nodeIds">All node ids in the graph.</param>
+    /// <param name="edgesFrom">Maps a node id to the ids it has directed edges to.</param>
+    /// <returns>One list of node ids per detected cycle.</returns>
+    public static List<List<string>> FindCycles(
+        IEnumerable<string> nodeIds,
+        Func<string, IEnumerable<string>> edgesFrom)
+    {
+        // Index nodes deterministically by ordinal id order.
+        var ids = nodeIds.Distinct(StringComparer.Ordinal).OrderBy(id => id, StringComparer.Ordinal).ToList();
+        int n = ids.Count;
+        var idToNode = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int i = 0; i < n; i++) idToNode[ids[i]] = i;
+
+        var adjacency = new List<int>[n];
+        var selfLoop = new bool[n];
+        for (int i = 0; i < n; i++)
+        {
+            adjacency[i] = new List<int>();
+            foreach (var successor in edgesFrom(ids[i]))
+            {
+                if (idToNode.TryGetValue(successor, out int target))
+                {
+                    if (target == i) selfLoop[i] = true;
+                    adjacency[i].Add(target);
+                }
+            }
+        }
+
+        var indexOf = new int[n];
+        var lowLink = new int[n];
+        var onStack = new bool[n];
+        var visited = new bool[n];
+        for (int i = 0; i < n; i++) indexOf[i] = -1;
+
+        var sccStack = new Stack<int>();
+        int nextIndex = 0;
+        var components = new List<List<int>>();
+
+        for (int start = 0; start < n; start++)
+        {
+            if (visited[start]) continue;
+
+            // Each work-stack frame tracks a node and the next adjacency slot to explore.
+            var work = new Stack<(int node, int next)>();
+            work.Push((start, 0));
+
+            while (work.Count > 0)
+            {
+                var (v, next) = work.Pop();
+
+                if (next == 0)
+                {
+                    visited[v] = true;
+                    indexOf[v] = lowLink[v] = nextIndex++;
+                    sccStack.Push(v);
+                    onStack[v] = true;
+                }
+
+                bool pushedChild = false;
+                for (int k = next; k < adjacency[v].Count; k++)
+                {
+                    int w = adjacency[v][k];
+                    if (indexOf[w] == -1)
+                    {
+                        // Resume v at k+1 after w is fully processed, then descend into w.
+                        work.Push((v, k + 1));
+                        work.Push((w, 0));
+                        pushedChild = true;
+                        break;
+                    }
+                    else if (onStack[w])
+                    {
+                        if (indexOf[w] < lowLink[v]) lowLink[v] = indexOf[w];
+                    }
+                }
+
+                if (pushedChild) continue;
+
+                // v is fully explored: close a component at its root and propagate to the parent.
+                if (lowLink[v] == indexOf[v])
+                {
+                    var component = new List<int>();
+                    int w;
+                    do
+                    {
+                        w = sccStack.Pop();
+                        onStack[w] = false;
+                        component.Add(w);
+                    } while (w != v);
+                    components.Add(component);
+                }
+
+                if (work.Count > 0)
+                {
+                    var parent = work.Peek();
+                    if (lowLink[v] < lowLink[parent.node]) lowLink[parent.node] = lowLink[v];
+                }
+            }
+        }
+
+        var cycles = new List<List<string>>();
+        foreach (var component in components)
+        {
+            bool isCycle = component.Count > 1 || (component.Count == 1 && selfLoop[component[0]]);
+            if (!isCycle) continue;
+            cycles.Add(component.Select(node => ids[node]).ToList());
+        }
+        return cycles;
+    }
+}
+
+/// <summary>
 /// Console entry point: reads an agreement package (from a path argument or the bundled fixture)
 /// and prints each finding's stable code, severity, evidence path and message.
 /// </summary>
@@ -936,10 +1232,11 @@ public static class Program
             return 2;
         }
 
-        AuditResult result;
+        var auditor = new AgreementAuditor();
+        MediationAgreement agreement;
         try
         {
-            result = new AgreementAuditor().AuditJson(json);
+            agreement = AgreementAuditor.Parse(json);
         }
         catch (AgreementParseException ex)
         {
@@ -947,7 +1244,31 @@ public static class Program
             return 2;
         }
 
+        var chain = auditor.BuildVersionChain(agreement);
+        AuditResult result = auditor.Audit(agreement);
+
         Console.WriteLine($"Audited package: {path}");
+        Console.WriteLine();
+
+        Console.WriteLine("Version chain (revision edges, ordered by amendment id):");
+        if (chain.Edges.Count == 0)
+        {
+            Console.WriteLine("  (no amendments)");
+        }
+        else
+        {
+            foreach (var edge in chain.Edges)
+            {
+                string arrow = edge.Kind == RevisionKind.Replacement
+                    ? $"{edge.FromClauseId} -> {edge.ToClauseId}"
+                    : $"(append) {edge.ToClauseId}";
+                Console.WriteLine($"  {edge.AmendmentId}: {arrow}  [{edge.EvidencePath}]");
+            }
+        }
+        Console.WriteLine();
+        Console.WriteLine($"Effective clause versions: {string.Join(", ", chain.EffectiveClauseIds())}");
+        Console.WriteLine();
+
         Console.WriteLine($"Issues found: {result.Issues.Count}");
         Console.WriteLine();
 

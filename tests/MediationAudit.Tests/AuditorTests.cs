@@ -191,14 +191,11 @@ public sealed class DeterminismTests
             // Same package, different field order and array-independent shuffles => identical output.
             Assert.Equal(Signature(a), Signature(b));
 
-            // Output is already sorted by stable identity, independent of discovery order.
+            // Output is already sorted by stable identity (code + position-independent sort key),
+            // independent of discovery order.
             var resorted = a.Issues
                 .OrderBy(i => i.Code, StringComparer.Ordinal)
-                .ThenBy(i => (int)i.Scope)
-                .ThenBy(i => i.PrimaryIndex)
-                .ThenBy(i => i.SecondaryIndex)
-                .ThenBy(i => i.Field, StringComparer.Ordinal)
-                .ThenBy(i => i.Message, StringComparer.Ordinal)
+                .ThenBy(i => i.SortKey, StringComparer.Ordinal)
                 .ToList();
             Assert.Equal(Signature(a), string.Join("\n",
                 resorted.Select(i => $"{i.Code}|{i.EvidencePath}|{i.Severity}")));

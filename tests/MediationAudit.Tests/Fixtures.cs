@@ -131,4 +131,72 @@ public static class Fixtures
       "signatures": [{"partyId": "PTY-A", "scope": ["AGR-WD", "AMD-01"], "signedAt": "2026-08-01T10:00:00Z"}]
     }
     """;
+
+    /// <summary>
+    /// A multi-step revision chain CL-01 -&gt; CL-01-R1 -&gt; CL-01-R2 that is fully consistent. Used to
+    /// verify the effective view (CL-01-R2) and that reordering the amendments array changes nothing.
+    /// </summary>
+    public const string RevisionChain = """
+    {
+      "agreementId": "AGR-CHAIN",
+      "parties": [{"id": "PTY-A", "name": "A"}],
+      "clauses": [{"id": "CL-01", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"}],
+      "amendments": [
+        {"id": "AMD-01", "replaces": "CL-01", "newClauseId": "CL-01-R1", "amountFen": 110},
+        {"id": "AMD-02", "replaces": "CL-01-R1", "newClauseId": "CL-01-R2", "amountFen": 120}
+      ],
+      "signatures": [{"partyId": "PTY-A", "scope": ["AGR-CHAIN", "AMD-01", "AMD-02"], "signedAt": "2026-08-01T10:00:00Z"}]
+    }
+    """;
+
+    /// <summary>An append amendment introduces a brand-new clause without replacing anything.</summary>
+    public const string AppendAmendment = """
+    {
+      "agreementId": "AGR-APP",
+      "parties": [{"id": "PTY-A", "name": "A"}],
+      "clauses": [{"id": "CL-01", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"}],
+      "amendments": [
+        {"id": "AMD-01", "newClauseId": "CL-02", "amountFen": 200, "due": "2026-09-01"}
+      ],
+      "signatures": [{"partyId": "PTY-A", "scope": ["AGR-APP", "AMD-01"], "signedAt": "2026-08-01T10:00:00Z"}]
+    }
+    """;
+
+    /// <summary>
+    /// A forked chain: two live amendments concurrently replace CL-01 with divergent versions. Both
+    /// forks are retained, the smallest-id amendment wins the effective view, and the fork surfaces
+    /// as MED_DUPLICATE_REPLACEMENT / MED_AMOUNT_INCONSISTENT.
+    /// </summary>
+    public const string ForkedChain = """
+    {
+      "agreementId": "AGR-FORK",
+      "parties": [{"id": "PTY-A", "name": "A"}],
+      "clauses": [{"id": "CL-01", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"}],
+      "amendments": [
+        {"id": "AMD-01", "replaces": "CL-01", "newClauseId": "CL-01-A", "amountFen": 150},
+        {"id": "AMD-02", "replaces": "CL-01", "newClauseId": "CL-01-B", "amountFen": 250}
+      ],
+      "signatures": [{"partyId": "PTY-A", "scope": ["AGR-FORK", "AMD-01", "AMD-02"], "signedAt": "2026-08-01T10:00:00Z"}]
+    }
+    """;
+
+    /// <summary>
+    /// A replacement cycle: CL-01 is replaced into CL-02 while CL-02 is replaced back into CL-01.
+    /// Triggers MED_REPLACEMENT_CYCLE. Both clauses pre-exist so nothing is a dangling target.
+    /// </summary>
+    public const string ReplacementCycle = """
+    {
+      "agreementId": "AGR-RCYC",
+      "parties": [{"id": "PTY-A", "name": "A"}],
+      "clauses": [
+        {"id": "CL-01", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"},
+        {"id": "CL-02", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"}
+      ],
+      "amendments": [
+        {"id": "AMD-01", "replaces": "CL-01", "newClauseId": "CL-02"},
+        {"id": "AMD-02", "replaces": "CL-02", "newClauseId": "CL-01"}
+      ],
+      "signatures": [{"partyId": "PTY-A", "scope": ["AGR-RCYC", "AMD-01", "AMD-02"], "signedAt": "2026-08-01T10:00:00Z"}]
+    }
+    """;
 }
