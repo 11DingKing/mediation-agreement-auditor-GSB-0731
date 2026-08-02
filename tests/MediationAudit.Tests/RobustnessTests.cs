@@ -408,10 +408,61 @@ public class RobustnessTests
                 sb.Append(",\"AM999\""); // 偶尔签署未知编号。
             }
 
-            sb.Append("]}");
+            sb.Append(']');
+            if (random.Next(3) > 0)
+            {
+                sb.Append(",\"seq\":").Append(random.Next(0, 6)); // 签署事件序号（乱序素材）。
+            }
+
+            sb.Append('}');
         }
 
         sb.Append(']');
+
+        // 撤回事件：同一时间戳、随机序号，覆盖四种目标语义（撤回整个协议保持低概率）。
+        int withdrawalCount = random.Next(0, 3);
+        if (withdrawalCount > 0)
+        {
+            sb.Append(",\"withdrawals\":[");
+            for (int w = 0; w < withdrawalCount; w++)
+            {
+                if (w > 0)
+                {
+                    sb.Append(',');
+                }
+
+                if (random.Next(4) > 0)
+                {
+                    sb.Append("{\"seq\":").Append(random.Next(0, 6)).Append(',');
+                }
+                else
+                {
+                    sb.Append('{');
+                }
+
+                sb.Append("\"at\":\"2026-08-01T10:00:00Z\",\"target\":\"");
+                switch (random.Next(10))
+                {
+                    case 0:
+                        sb.Append("agreement\"");
+                        break;
+                    case >= 1 and <= 3:
+                        sb.Append("amendment\",\"amendmentId\":\"AM")
+                            .Append(random.Next(4) == 0 ? 999 : random.Next(Math.Max(amendmentCount, 1))).Append('"');
+                        break;
+                    case >= 4 and <= 6:
+                        sb.Append("party\",\"partyId\":\"P").Append(random.Next(partyCount)).Append('"');
+                        break;
+                    default:
+                        sb.Append("signature\",\"partyId\":\"P").Append(random.Next(partyCount)).Append('"');
+                        break;
+                }
+
+                sb.Append('}');
+            }
+
+            sb.Append(']');
+        }
         if (random.Next(2) == 0)
         {
             sb.Append(",\"totalAmountFen\":").Append(random.Next(1, 20000));

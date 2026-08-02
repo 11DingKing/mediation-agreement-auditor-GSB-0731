@@ -40,6 +40,12 @@ public static class IssueCodes
 
     /// <summary>引用仍指向已被生效补充协议替换的条款，应改指向替换后的条款。</summary>
     public const string StaleReference = "MED_STALE_REFERENCE";
+
+    /// <summary>
+    /// 已签署事实被撤回（rescind）。签署记录保留在档案中不被删除或改写——撤回行为本身
+    /// 作为稳定问题报告，且被撤回的签署不再计入签署范围覆盖。
+    /// </summary>
+    public const string SignatureRescinded = "MED_SIGNATURE_RESCINDED";
 }
 
 /// <summary>
@@ -70,6 +76,49 @@ public enum VersionStatus
     /// 不参与一致性检查，等待工作人员裁决。
     /// </summary>
     Contested = 2,
+
+    /// <summary>整个协议被撤回后，全部版本进入已撤回状态，不再参与任何检查。</summary>
+    Withdrawn = 3,
+}
+
+/// <summary>
+/// 撤回事件的目标类别：区分"撤回某份补充协议"、"撤回整个协议"、"移除当事人"与"撤回已签署事实"四种语义。
+/// </summary>
+public enum WithdrawalTarget
+{
+    /// <summary>撤回某份补充协议：该补充协议不产生任何版本（与静态 withdrawn 标记同效）。</summary>
+    Amendment = 0,
+
+    /// <summary>撤回整个协议：全部条款版本失效，有效条款视图为空。</summary>
+    Agreement = 1,
+
+    /// <summary>移除当事人：该当事人退出协议，其义务与签署按悬空引用规则处理。</summary>
+    Party = 2,
+
+    /// <summary>撤回已签署事实：签署记录保留，但撤回行为被报告且签署不再计入覆盖。</summary>
+    Signature = 3,
+}
+
+/// <summary>
+/// 一条撤回事件。对应 JSON 中 <c>withdrawals</c> 数组的元素。
+/// 事件可以乱序到达、时间戳相同：结果一律由事件序号 <see cref="Seq"/> 决定，与到达顺序和时间戳无关。
+/// </summary>
+public sealed class Withdrawal
+{
+    /// <summary>事件序号；缺省时视为 -1（先于所有显式编号事件，按到达顺序排列）。</summary>
+    public long? Seq { get; init; }
+
+    /// <summary>事件时间戳（ISO-8601），仅用于展示，不参与排序。</summary>
+    public string? At { get; init; }
+
+    /// <summary>撤回目标类别。</summary>
+    public required WithdrawalTarget Target { get; init; }
+
+    /// <summary>目标为 <see cref="WithdrawalTarget.Amendment"/> 时的补充协议编号。</summary>
+    public string? AmendmentId { get; init; }
+
+    /// <summary>目标为 <see cref="WithdrawalTarget.Party"/> 或 <see cref="WithdrawalTarget.Signature"/> 时的当事人编号。</summary>
+    public string? PartyId { get; init; }
 }
 
 /// <summary>
@@ -179,6 +228,12 @@ public sealed class Signature
 
     /// <summary>签署时间（ISO-8601），仅用于展示，不参与审计判断。</summary>
     public string? SignedAt { get; init; }
+
+    /// <summary>
+    /// 事件序号：与撤回事件统一排序。同一时间戳下乱序到达的签署与撤回，结果由序号决定；
+    /// 缺省时视为 -1（先于所有显式编号事件）。
+    /// </summary>
+    public long? Seq { get; init; }
 }
 
 /// <summary>
@@ -199,8 +254,11 @@ public sealed class Agreement
     /// <summary>补充协议列表。审计语义与数组顺序无关：交换顺序不改变有效条款视图与问题输出。</summary>
     public IReadOnlyList<Amendment> Amendments { get; init; } = Array.Empty<Amendment>();
 
-    /// <summary>签署记录列表。</summary>
+    /// <summary>签署记录列表。签署即签署事件，可携带事件序号 <see cref="Signature.Seq"/>。</summary>
     public IReadOnlyList<Signature> Signatures { get; init; } = Array.Empty<Signature>();
+
+    /// <summary>撤回事件列表。乱序到达时按事件序号 <see cref="Withdrawal.Seq"/> 确定结果。</summary>
+    public IReadOnlyList<Withdrawal> Withdrawals { get; init; } = Array.Empty<Withdrawal>();
 
     /// <summary>协议声明的金额总额（分）；为 <c>null</c> 时不做总额一致性检查。</summary>
     public long? TotalAmountFen { get; init; }
@@ -246,6 +304,7 @@ public sealed class Agreement
                 Clauses = ParseClauses(root),
                 Amendments = ParseAmendments(root),
                 Signatures = ParseSignatures(root),
+                Withdrawals = ParseWithdrawals(root),
                 TotalAmountFen = TryGetProperty(root, "totalAmountFen", out JsonElement totalEl)
                     && totalEl.ValueKind == JsonValueKind.Number
                     && totalEl.TryGetInt64(out long total)
@@ -445,6 +504,52 @@ public sealed class Agreement
                     PartyId = partyId,
                     Scope = GetStringArray(el, "scope"),
                     SignedAt = GetString(el, "signedAt"),
+                    Seq = GetInt64(el, "seq"),
+                });
+            }
+        }
+
+        return list;
+    }
+
+    private static IReadOnlyList<Withdrawal> ParseWithdrawals(JsonElement root)
+    {
+        var list = new List<Withdrawal>();
+        if (TryGetProperty(root, "withdrawals", out JsonElement arr) && arr.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement el in arr.EnumerateArray())
+            {
+                if (el.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                WithdrawalTarget? target = GetString(el, "target") switch
+                {
+                    "amendment" => WithdrawalTarget.Amendment,
+                    "agreement" => WithdrawalTarget.Agreement,
+                    "party" => WithdrawalTarget.Party,
+                    "signature" => WithdrawalTarget.Signature,
+                    _ => null,
+                };
+                string? amendmentId = GetString(el, "amendmentId");
+                string? partyId = GetString(el, "partyId");
+
+                // 目标类别必需配套的编号：缺失则该事件无法识别，跳过。
+                if (target is null
+                    || (target == WithdrawalTarget.Amendment && amendmentId is null)
+                    || (target is WithdrawalTarget.Party or WithdrawalTarget.Signature && partyId is null))
+                {
+                    continue;
+                }
+
+                list.Add(new Withdrawal
+                {
+                    Seq = GetInt64(el, "seq"),
+                    At = GetString(el, "at"),
+                    Target = target.Value,
+                    AmendmentId = amendmentId,
+                    PartyId = partyId,
                 });
             }
         }
@@ -550,6 +655,15 @@ public sealed class VersionChain
 
     /// <summary>有效条款视图：状态为 <see cref="VersionStatus.Effective"/> 的版本子集，按文档顺序排列。</summary>
     public required IReadOnlyList<ClauseVersion> EffectiveVersions { get; init; }
+
+    /// <summary>整个协议是否已被撤回。为 <c>true</c> 时全部版本为已撤回状态，有效视图为空。</summary>
+    public required bool AgreementWithdrawn { get; init; }
+
+    /// <summary>已被撤回的补充协议编号（静态标记与撤回事件合并），按补充协议数组顺序排列。</summary>
+    public required IReadOnlyList<string> WithdrawnAmendmentIds { get; init; }
+
+    /// <summary>已被移除的当事人编号，按事件序号与到达顺序排列。</summary>
+    public required IReadOnlyList<string> RemovedPartyIds { get; init; }
 }
 
 /// <summary>
@@ -582,6 +696,7 @@ public sealed class AuditResult
         {
             writer.WriteStartObject();
             writer.WriteString("agreementId", AgreementId);
+            writer.WriteBoolean("agreementWithdrawn", Versions.AgreementWithdrawn);
             writer.WriteNumber("issueCount", Issues.Count);
             writer.WriteStartArray("issues");
             foreach (AuditIssue issue in Issues)
@@ -592,6 +707,20 @@ public sealed class AuditResult
                 writer.WriteString("message", issue.Message);
                 writer.WriteString("evidencePath", issue.EvidencePath);
                 writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
+            writer.WriteStartArray("withdrawnAmendments");
+            foreach (string id in Versions.WithdrawnAmendmentIds)
+            {
+                writer.WriteStringValue(id);
+            }
+
+            writer.WriteEndArray();
+            writer.WriteStartArray("removedParties");
+            foreach (string id in Versions.RemovedPartyIds)
+            {
+                writer.WriteStringValue(id);
             }
 
             writer.WriteEndArray();
@@ -762,6 +891,8 @@ public static class AgreementAuditor
         private readonly List<VersionNode> _nodes = new();
         private readonly Dictionary<string, VersionNode> _canonical = new(StringComparer.Ordinal);
         private readonly List<RevisionEdge> _edges = new();
+        private readonly HashSet<string> _withdrawnAmendmentIds = new(StringComparer.Ordinal);
+        private bool _agreementWithdrawn;
 
         public ChainBuilder(Agreement agreement, Action<string, IssueSeverity, string, string> emit)
         {
@@ -771,6 +902,7 @@ public static class AgreementAuditor
 
         public BuiltChain Build()
         {
+            CollectWithdrawals();
             CreateBaseNodes();
             CreateProductNodes();
             ConnectEdges();
@@ -779,8 +911,48 @@ public static class AgreementAuditor
             FlagCycles();
             PropagateContested();
             ComputeStatuses();
-            return new BuiltChain(_agreement, _nodes, _canonical, _edges);
+            return new BuiltChain(_agreement, _nodes, _canonical, _edges, _agreementWithdrawn, WithdrawnAmendmentIdsInOrder(), RemovedPartyIdsInOrder());
         }
+
+        /// <summary>
+        /// 汇总撤回语义：撤回某份补充协议（静态标记或撤回事件）→ 不产生版本；
+        /// 撤回整个协议 → 全部版本失效；移除当事人 → 记录于版本链供检查使用。
+        /// 三者均为终态事实，与事件序号和到达顺序无关。
+        /// </summary>
+        private void CollectWithdrawals()
+        {
+            foreach (Amendment a in _agreement.Amendments)
+            {
+                if (a.Withdrawn)
+                {
+                    _withdrawnAmendmentIds.Add(a.Id);
+                }
+            }
+
+            foreach (Withdrawal w in _agreement.Withdrawals)
+            {
+                switch (w.Target)
+                {
+                    case WithdrawalTarget.Amendment:
+                        _withdrawnAmendmentIds.Add(w.AmendmentId!);
+                        break;
+                    case WithdrawalTarget.Agreement:
+                        _agreementWithdrawn = true;
+                        break;
+                }
+            }
+        }
+
+        private IReadOnlyList<string> WithdrawnAmendmentIdsInOrder()
+            => _agreement.Amendments.Where(a => _withdrawnAmendmentIds.Contains(a.Id)).Select(a => a.Id).ToList();
+
+        private IReadOnlyList<string> RemovedPartyIdsInOrder()
+            => _agreement.Withdrawals
+                .Where(w => w.Target == WithdrawalTarget.Party)
+                .OrderBy(w => w.Seq ?? -1)
+                .Select(w => w.PartyId!)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
 
         private void AddNode(VersionNode node)
         {
@@ -829,7 +1001,7 @@ public static class AgreementAuditor
             for (int i = 0; i < _agreement.Amendments.Count; i++)
             {
                 Amendment a = _agreement.Amendments[i];
-                if (a.Withdrawn)
+                if (_withdrawnAmendmentIds.Contains(a.Id))
                 {
                     continue; // 已撤回：不产生任何版本，也不要求签署。
                 }
@@ -893,7 +1065,7 @@ public static class AgreementAuditor
             for (int i = 0; i < _agreement.Amendments.Count; i++)
             {
                 Amendment a = _agreement.Amendments[i];
-                if (a.Withdrawn || a.Replaces is null || string.IsNullOrEmpty(a.NewClauseId))
+                if (_withdrawnAmendmentIds.Contains(a.Id) || a.Replaces is null || string.IsNullOrEmpty(a.NewClauseId))
                 {
                     continue;
                 }
@@ -1066,6 +1238,20 @@ public static class AgreementAuditor
             {
                 edge.Applied = edge.Source.Out.Count == 1 && !edge.Target.Contested;
             }
+
+            // 撤回整个协议：全部版本失效（终态），所有修订边不再生效。
+            if (_agreementWithdrawn)
+            {
+                foreach (VersionNode node in _nodes)
+                {
+                    node.Status = VersionStatus.Withdrawn;
+                }
+
+                foreach (RevisionEdge edge in _edges)
+                {
+                    edge.Applied = false;
+                }
+            }
         }
 
         /// <summary>最短且稳定的证据路径：先比段数，再按路径比较器逐段比较。</summary>
@@ -1173,12 +1359,22 @@ public static class AgreementAuditor
     {
         private readonly Agreement _agreement;
 
-        public BuiltChain(Agreement agreement, List<VersionNode> nodes, Dictionary<string, VersionNode> canonical, List<RevisionEdge> edges)
+        public BuiltChain(
+            Agreement agreement,
+            List<VersionNode> nodes,
+            Dictionary<string, VersionNode> canonical,
+            List<RevisionEdge> edges,
+            bool agreementWithdrawn,
+            IReadOnlyList<string> withdrawnAmendmentIds,
+            IReadOnlyList<string> removedPartyIds)
         {
             _agreement = agreement;
             Nodes = nodes;
             Canonical = canonical;
             Edges = edges;
+            AgreementWithdrawn = agreementWithdrawn;
+            WithdrawnAmendmentIds = withdrawnAmendmentIds;
+            RemovedPartyIds = removedPartyIds;
             Effective = Nodes.Where(n => n.Status == VersionStatus.Effective).OrderBy(n => n.Order).ToList();
         }
 
@@ -1190,9 +1386,15 @@ public static class AgreementAuditor
 
         public List<VersionNode> Effective { get; }
 
+        public bool AgreementWithdrawn { get; }
+
+        public IReadOnlyList<string> WithdrawnAmendmentIds { get; }
+
+        public IReadOnlyList<string> RemovedPartyIds { get; }
+
         /// <summary>实际生效（已被应用）的补充协议编号集合。</summary>
         public IEnumerable<string> AppliedAmendmentIds => _agreement.Amendments
-            .Where(a => !a.Withdrawn)
+            .Where(a => !WithdrawnAmendmentIds.Contains(a.Id))
             .Select(a => a.Id)
             .Where(id => Edges.Any(e => e.AmendmentId == id && e.Applied)
                 || Nodes.Any(n => n.ProducedBy == id && n.IsAppend && n.Status != VersionStatus.Contested));
@@ -1318,6 +1520,9 @@ public static class AgreementAuditor
                     Applied = e.Applied,
                 }).ToList(),
                 EffectiveVersions = Effective.Select(Project).ToList(),
+                AgreementWithdrawn = AgreementWithdrawn,
+                WithdrawnAmendmentIds = WithdrawnAmendmentIds,
+                RemovedPartyIds = RemovedPartyIds,
             };
         }
     }
@@ -1327,6 +1532,7 @@ public static class AgreementAuditor
         private readonly Agreement _agreement;
         private readonly List<AuditIssue> _issues = new();
         private readonly HashSet<string> _seen = new(StringComparer.Ordinal);
+        private readonly HashSet<int> _rescindedSignatures = new();
         private BuiltChain _chain = null!;
 
         public Engine(Agreement agreement) => _agreement = agreement;
@@ -1334,10 +1540,15 @@ public static class AgreementAuditor
         public AuditResult Run()
         {
             _chain = new ChainBuilder(_agreement, Emit).Build();
+            ReplaySignatureEvents();
             CheckReferences();
             CheckDateOrder();
-            CheckAmounts();
-            CheckSignatures();
+            if (!_chain.AgreementWithdrawn)
+            {
+                CheckAmounts();
+                CheckSignatures();
+            }
+
             CheckReferenceCycles();
 
             List<AuditIssue> sorted = _issues
@@ -1352,6 +1563,71 @@ public static class AgreementAuditor
                 Issues = sorted,
                 Versions = _chain.ToPublicChain(),
             };
+        }
+
+        /// <summary>
+        /// 签署事件与撤回事件合并为统一事件流，按（事件序号, 到达顺序）重放：
+        /// 同一时间戳下乱序到达的撤回与新增签署，结果一律由事件序号决定。
+        /// 被撤回的签署保留在档案中（记录数组下标），不报缺、不删除，只报
+        /// <see cref="IssueCodes.SignatureRescinded"/> 且不再计入签署范围覆盖。
+        /// </summary>
+        private void ReplaySignatureEvents()
+        {
+            var events = new List<(long Seq, int Arrival, bool IsWithdrawal, int Index)>();
+            for (int i = 0; i < _agreement.Signatures.Count; i++)
+            {
+                events.Add((_agreement.Signatures[i].Seq ?? -1, i, false, i));
+            }
+
+            for (int j = 0; j < _agreement.Withdrawals.Count; j++)
+            {
+                events.Add((_agreement.Withdrawals[j].Seq ?? -1, _agreement.Signatures.Count + j, true, j));
+            }
+
+            var active = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+            foreach ((long _, int _, bool isWithdrawal, int index) in events.OrderBy(e => e.Seq).ThenBy(e => e.Arrival))
+            {
+                if (!isWithdrawal)
+                {
+                    string pid = _agreement.Signatures[index].PartyId;
+                    if (!active.TryGetValue(pid, out List<int>? list))
+                    {
+                        active[pid] = list = new List<int>();
+                    }
+
+                    list.Add(index);
+                    continue;
+                }
+
+                Withdrawal w = _agreement.Withdrawals[index];
+                if (w.Target != WithdrawalTarget.Signature)
+                {
+                    continue;
+                }
+
+                if (active.TryGetValue(w.PartyId!, out List<int>? signed) && signed.Count > 0)
+                {
+                    foreach (int s in signed)
+                    {
+                        _rescindedSignatures.Add(s);
+                    }
+
+                    signed.Clear();
+                    Emit(
+                        IssueCodes.SignatureRescinded,
+                        IssueSeverity.Error,
+                        $"当事人 '{w.PartyId}' 的已签署事实被撤回；签署记录保留在档案中，但不再计入签署范围覆盖。",
+                        $"$.withdrawals[{index}].partyId");
+                }
+                else
+                {
+                    Emit(
+                        IssueCodes.SignatureRescinded,
+                        IssueSeverity.Error,
+                        $"撤回事件要求撤回当事人 '{w.PartyId}' 的已签署事实，但按事件序号重放后其没有生效中的签署。",
+                        $"$.withdrawals[{index}].partyId");
+                }
+            }
         }
 
         private void Emit(string code, IssueSeverity severity, string message, string evidencePath)
@@ -1370,7 +1646,7 @@ public static class AgreementAuditor
                 (string? obligor, string? obligorPath) = _chain.ResolveObligor(node);
                 if (obligor is not null
                     && obligorPath is not null
-                    && !_agreement.Parties.Any(p => p.Id == obligor))
+                    && !EffectivePartyIds().Contains(obligor))
                 {
                     Emit(
                         IssueCodes.UnknownReference,
@@ -1461,9 +1737,18 @@ public static class AgreementAuditor
             }
         }
 
+        /// <summary>当前有效的当事人编号：协议当事人减去被撤回事件移除者。</summary>
+        private HashSet<string> EffectivePartyIds()
+        {
+            var removed = new HashSet<string>(_chain.RemovedPartyIds, StringComparer.Ordinal);
+            return new HashSet<string>(
+                _agreement.Parties.Where(p => !removed.Contains(p.Id)).Select(p => p.Id),
+                StringComparer.Ordinal);
+        }
+
         private void CheckSignatures()
         {
-            var partyIds = new HashSet<string>(_agreement.Parties.Select(p => p.Id), StringComparer.Ordinal);
+            HashSet<string> partyIds = EffectivePartyIds();
 
             // 有效签署范围：协议本体 + 已生效（已应用且未未决）补充协议。
             var validScope = new HashSet<string>(StringComparer.Ordinal) { _agreement.Id };
@@ -1497,9 +1782,15 @@ public static class AgreementAuditor
                 }
             }
 
+            var removedParties = new HashSet<string>(_chain.RemovedPartyIds, StringComparer.Ordinal);
             for (int i = 0; i < _agreement.Parties.Count; i++)
             {
                 Party party = _agreement.Parties[i];
+                if (removedParties.Contains(party.Id))
+                {
+                    continue; // 已移除的当事人不再要求签署。
+                }
+
                 var signed = new HashSet<string>(StringComparer.Ordinal);
                 int firstEntry = -1;
                 for (int s = 0; s < _agreement.Signatures.Count; s++)
@@ -1509,6 +1800,12 @@ public static class AgreementAuditor
                         if (firstEntry < 0)
                         {
                             firstEntry = s;
+                        }
+
+                        // 被撤回的签署保留档案，但不计入覆盖。
+                        if (_rescindedSignatures.Contains(s))
+                        {
+                            continue;
                         }
 
                         foreach (string scope in _agreement.Signatures[s].Scope)
