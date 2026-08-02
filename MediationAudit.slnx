@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MediationAudit/MediationAudit.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MediationAudit.Tests/MediationAudit.Tests.csproj" />
+  </Folder>
+</Solution>
