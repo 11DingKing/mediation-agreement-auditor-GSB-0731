@@ -199,4 +199,117 @@ public static class Fixtures
       "signatures": [{"partyId": "PTY-A", "scope": ["AGR-RCYC", "AMD-01", "AMD-02"], "signedAt": "2026-08-01T10:00:00Z"}]
     }
     """;
+
+    /// <summary>Event log revokes a single amendment (AMD-01). The amendment id must exist.</summary>
+    public const string EventRevokeAmendment = """
+    {
+      "agreementId": "AGR-EVA",
+      "parties": [{"id": "PTY-A", "name": "A"}],
+      "clauses": [{"id": "CL-01", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"}],
+      "amendments": [{"id": "AMD-01", "replaces": "CL-01", "newClauseId": "CL-01-R1", "amountFen": 90}],
+      "signatures": [{"partyId": "PTY-A", "scope": ["AGR-EVA"], "signedAt": "2026-08-01T10:00:00Z"}],
+      "events": [
+        {"seq": 1, "type": "sign", "partyId": "PTY-A", "scope": "AMD-01", "at": "2026-08-01T10:00:00Z"},
+        {"seq": 2, "type": "revokeAmendment", "amendmentId": "AMD-01", "at": "2026-08-02T09:00:00Z"}
+      ]
+    }
+    """;
+
+    /// <summary>Event log revokes the entire agreement.</summary>
+    public const string EventRevokeAgreement = """
+    {
+      "agreementId": "AGR-EVG",
+      "parties": [{"id": "PTY-A", "name": "A"}, {"id": "PTY-B", "name": "B"}],
+      "clauses": [{"id": "CL-01", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"}],
+      "amendments": [],
+      "signatures": [{"partyId": "PTY-A", "scope": ["AGR-EVG"], "signedAt": "2026-08-01T10:00:00Z"}],
+      "events": [
+        {"seq": 1, "type": "revokeAgreement", "at": "2026-08-03T09:00:00Z"}
+      ]
+    }
+    """;
+
+    /// <summary>Event log removes a party (PTY-B), dropping it and its signing obligation.</summary>
+    public const string EventRemoveParty = """
+    {
+      "agreementId": "AGR-EVP",
+      "parties": [{"id": "PTY-A", "name": "A"}, {"id": "PTY-B", "name": "B"}],
+      "clauses": [{"id": "CL-01", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"}],
+      "amendments": [],
+      "signatures": [
+        {"partyId": "PTY-A", "scope": ["AGR-EVP"], "signedAt": "2026-08-01T10:00:00Z"},
+        {"partyId": "PTY-B", "scope": ["AGR-EVP"], "signedAt": "2026-08-01T10:01:00Z"}
+      ],
+      "events": [
+        {"seq": 1, "type": "removeParty", "partyId": "PTY-B", "at": "2026-08-02T09:00:00Z"}
+      ]
+    }
+    """;
+
+    /// <summary>
+    /// Event log attempts to revoke the recorded fact that PTY-A signed the agreement. Must report
+    /// MED_SIGNED_FACT_REVOCATION_ATTEMPT and keep the signature (history is immutable).
+    /// </summary>
+    public const string EventRevokeSignedFact = """
+    {
+      "agreementId": "AGR-EVS",
+      "parties": [{"id": "PTY-A", "name": "A"}],
+      "clauses": [{"id": "CL-01", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"}],
+      "amendments": [],
+      "signatures": [{"partyId": "PTY-A", "scope": ["AGR-EVS"], "signedAt": "2026-08-01T10:00:00Z"}],
+      "events": [
+        {"seq": 1, "type": "revokeSignedFact", "partyId": "PTY-A", "scope": "AGR-EVS", "at": "2026-08-02T09:00:00Z"}
+      ]
+    }
+    """;
+
+    /// <summary>
+    /// A revoke and a new signing arrive out of array order but under the SAME wall-clock timestamp.
+    /// The sequence numbers (revoke AMD-01 at seq 2, sign AMD-01 again at seq 3) are the authority:
+    /// after folding by sequence, AMD-01 ends revoked-then-re-signed, so PTY-A's effective signatures
+    /// include AGR-OOO and AMD-01, and AMD-01 is on the revoked list. Array order must not matter.
+    /// </summary>
+    public const string EventSameTimestampOutOfOrder = """
+    {
+      "agreementId": "AGR-OOO",
+      "parties": [{"id": "PTY-A", "name": "A"}],
+      "clauses": [{"id": "CL-01", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"}],
+      "amendments": [{"id": "AMD-01", "replaces": "CL-01", "newClauseId": "CL-01-R1", "amountFen": 90}],
+      "signatures": [],
+      "events": [
+        {"seq": 3, "type": "sign", "partyId": "PTY-A", "scope": "AMD-01", "at": "2026-08-02T09:00:00Z"},
+        {"seq": 1, "type": "sign", "partyId": "PTY-A", "scope": "AGR-OOO", "at": "2026-08-02T09:00:00Z"},
+        {"seq": 2, "type": "revokeAmendment", "amendmentId": "AMD-01", "at": "2026-08-02T09:00:00Z"}
+      ]
+    }
+    """;
+
+    /// <summary>Two events collide on the same sequence number. Triggers MED_EVENT_SEQUENCE_CONFLICT.</summary>
+    public const string EventSequenceConflict = """
+    {
+      "agreementId": "AGR-SEQ",
+      "parties": [{"id": "PTY-A", "name": "A"}],
+      "clauses": [{"id": "CL-01", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"}],
+      "amendments": [{"id": "AMD-01", "replaces": "CL-01", "newClauseId": "CL-01-R1", "amountFen": 90}],
+      "signatures": [{"partyId": "PTY-A", "scope": ["AGR-SEQ"], "signedAt": "2026-08-01T10:00:00Z"}],
+      "events": [
+        {"seq": 5, "type": "sign", "partyId": "PTY-A", "scope": "AMD-01", "at": "2026-08-02T09:00:00Z"},
+        {"seq": 5, "type": "revokeAmendment", "amendmentId": "AMD-01", "at": "2026-08-02T09:00:01Z"}
+      ]
+    }
+    """;
+
+    /// <summary>An event references an unknown party. Triggers MED_EVENT_TARGET_UNKNOWN.</summary>
+    public const string EventUnknownTarget = """
+    {
+      "agreementId": "AGR-EUT",
+      "parties": [{"id": "PTY-A", "name": "A"}],
+      "clauses": [{"id": "CL-01", "obligor": "PTY-A", "amountFen": 100, "due": "2026-08-01"}],
+      "amendments": [],
+      "signatures": [{"partyId": "PTY-A", "scope": ["AGR-EUT"], "signedAt": "2026-08-01T10:00:00Z"}],
+      "events": [
+        {"seq": 1, "type": "removeParty", "partyId": "PTY-Z", "at": "2026-08-02T09:00:00Z"}
+      ]
+    }
+    """;
 }

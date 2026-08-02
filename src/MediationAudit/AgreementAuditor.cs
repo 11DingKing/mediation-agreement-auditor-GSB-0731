@@ -44,6 +44,9 @@ public enum EvidenceScope
 
     /// <summary>The <c>$.signatures</c> array.</summary>
     Signatures = 4,
+
+    /// <summary>The <c>$.events</c> array (the ordered revocation/signing event log).</summary>
+    Events = 5,
 }
 
 /// <summary>
@@ -79,6 +82,18 @@ public static class MediationIssueCodes
 
     /// <summary>A withdrawn amendment is still referenced by a signature scope or a live clause.</summary>
     public const string WithdrawnAmendmentReferenced = "MED_WITHDRAWN_AMENDMENT_REFERENCED";
+
+    /// <summary>
+    /// An event attempts to revoke the fact that a party already signed. History is immutable, so the
+    /// signature is retained and this stable code is reported instead of silently rewriting the past.
+    /// </summary>
+    public const string SignedFactRevocationAttempt = "MED_SIGNED_FACT_REVOCATION_ATTEMPT";
+
+    /// <summary>An event references a party, amendment or agreement id that does not exist in the package.</summary>
+    public const string EventTargetUnknown = "MED_EVENT_TARGET_UNKNOWN";
+
+    /// <summary>Two or more events share the same sequence number, so their ordering is ambiguous.</summary>
+    public const string EventSequenceConflict = "MED_EVENT_SEQUENCE_CONFLICT";
 }
 
 /// <summary>A party to the mediation agreement.</summary>
@@ -134,6 +149,58 @@ public sealed record Signature(
     string PartyId,
     IReadOnlyList<string> Scope,
     DateTimeOffset? SignedAt,
+    int SourceIndex);
+
+/// <summary>
+/// The semantic of an entry in the ordered event log (<c>$.events</c>). The four revocation-family
+/// verbs are distinct on purpose: three of them fold into the effective state, while
+/// <see cref="RevokeSignedFact"/> is never allowed to rewrite history.
+/// </summary>
+public enum AgreementEventType
+{
+    /// <summary>A party signs a signable id (base agreement or amendment) at this point in the log.</summary>
+    Sign = 0,
+
+    /// <summary>Withdraw a single amendment (equivalent to marking it withdrawn from this event onward).</summary>
+    RevokeAmendment = 1,
+
+    /// <summary>Withdraw the entire agreement, invalidating every signature scope going forward.</summary>
+    RevokeAgreement = 2,
+
+    /// <summary>Remove a party from the agreement, dropping the party and its signing obligation.</summary>
+    RemoveParty = 3,
+
+    /// <summary>
+    /// Attempt to revoke the recorded fact that a party already signed. This must not alter history;
+    /// the auditor keeps the signature and reports <see cref="MediationIssueCodes.SignedFactRevocationAttempt"/>.
+    /// </summary>
+    RevokeSignedFact = 4,
+
+    /// <summary>An unrecognized verb; retained verbatim so the log stays complete but otherwise inert.</summary>
+    Unknown = 5,
+}
+
+/// <summary>
+/// One entry in the append-only event log. Events are applied in ascending <see cref="Sequence"/>
+/// order — never in array/arrival order — so that a revocation and a new signing that arrive out of
+/// order under the same wall-clock timestamp still resolve deterministically by their sequence number.
+/// </summary>
+/// <param name="Sequence">The authoritative event ordinal defined by the source material.</param>
+/// <param name="Type">The event semantic.</param>
+/// <param name="RawType">The verbatim <c>type</c> string as it appeared in the JSON.</param>
+/// <param name="PartyId">Party id the event concerns, if any.</param>
+/// <param name="AmendmentId">Amendment id the event concerns, if any.</param>
+/// <param name="Scope">Scope id the event concerns (for sign/revoke-signed-fact), if any.</param>
+/// <param name="At">Wall-clock timestamp of the event, if declared. Never used for ordering.</param>
+/// <param name="SourceIndex">Zero-based index of this event inside the original <c>$.events</c> array.</param>
+public sealed record AgreementEvent(
+    long Sequence,
+    AgreementEventType Type,
+    string RawType,
+    string? PartyId,
+    string? AmendmentId,
+    string? Scope,
+    DateTimeOffset? At,
     int SourceIndex);
 
 /// <summary>
@@ -265,6 +332,42 @@ public sealed class ClauseVersionChain
 }
 
 /// <summary>
+/// The effective signing/participation state after folding the ordered event log over the base
+/// package. The fold is a pure function of the events sorted by <see cref="AgreementEvent.Sequence"/>
+/// (never their array/arrival order), so the same package always yields the same state.
+/// </summary>
+public sealed class EffectiveState
+{
+    internal EffectiveState(
+        bool agreementRevoked,
+        IReadOnlyList<string> activeParties,
+        IReadOnlyList<string> revokedAmendmentIds,
+        IReadOnlyDictionary<string, IReadOnlyList<string>> effectiveSignatures)
+    {
+        AgreementRevoked = agreementRevoked;
+        ActiveParties = activeParties;
+        RevokedAmendmentIds = revokedAmendmentIds;
+        EffectiveSignatures = effectiveSignatures;
+    }
+
+    /// <summary>True when a revoke-agreement event has invalidated the whole package.</summary>
+    public bool AgreementRevoked { get; }
+
+    /// <summary>Party ids still participating after any remove-party events, in ascending order.</summary>
+    public IReadOnlyList<string> ActiveParties { get; }
+
+    /// <summary>Amendment ids revoked by events (in addition to any statically withdrawn), ascending.</summary>
+    public IReadOnlyList<string> RevokedAmendmentIds { get; }
+
+    /// <summary>
+    /// For each still-active party, the set of scope ids it has effectively signed after the fold,
+    /// keyed by party id (ascending) with each scope list ascending. A revoke-signed-fact never
+    /// removes an entry here — history is immutable — it only produces an audit issue.
+    /// </summary>
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> EffectiveSignatures { get; }
+}
+
+/// <summary>
 /// A parsed mediation agreement package: the root aggregate the auditor operates on. Element order
 /// is preserved exactly as it appeared in the source JSON so evidence paths stay stable.
 /// </summary>
@@ -285,24 +388,30 @@ public sealed class MediationAgreement
     /// <summary>Signatures in source order.</summary>
     public IReadOnlyList<Signature> Signatures { get; }
 
+    /// <summary>Ordered event log entries in source (array) order. Fold them by sequence, not by this order.</summary>
+    public IReadOnlyList<AgreementEvent> Events { get; }
+
     /// <summary>Initializes a new <see cref="MediationAgreement"/>.</summary>
     /// <param name="agreementId">The agreement identifier.</param>
     /// <param name="parties">Parties in source order.</param>
     /// <param name="clauses">Clauses in source order.</param>
     /// <param name="amendments">Amendments in source order.</param>
     /// <param name="signatures">Signatures in source order.</param>
+    /// <param name="events">Event log entries in source order (optional).</param>
     public MediationAgreement(
         string agreementId,
         IReadOnlyList<Party> parties,
         IReadOnlyList<Clause> clauses,
         IReadOnlyList<Amendment> amendments,
-        IReadOnlyList<Signature> signatures)
+        IReadOnlyList<Signature> signatures,
+        IReadOnlyList<AgreementEvent>? events = null)
     {
         AgreementId = agreementId;
         Parties = parties;
         Clauses = clauses;
         Amendments = amendments;
         Signatures = signatures;
+        Events = events ?? Array.Empty<AgreementEvent>();
     }
 }
 
@@ -494,9 +603,34 @@ public sealed class AgreementAuditor
                     index));
             }
 
-            return new MediationAgreement(agreementId, parties, clauses, amendments, signatures);
+            var events = new List<AgreementEvent>();
+            foreach (var (element, index) in EnumerateArray(root, "events"))
+            {
+                string rawType = GetString(element, "type") ?? string.Empty;
+                events.Add(new AgreementEvent(
+                    GetLong(element, "seq") ?? long.MinValue,
+                    ParseEventType(rawType),
+                    rawType,
+                    GetString(element, "partyId"),
+                    GetString(element, "amendmentId"),
+                    GetString(element, "scope"),
+                    GetDate(element, "at"),
+                    index));
+            }
+
+            return new MediationAgreement(agreementId, parties, clauses, amendments, signatures, events);
         }
     }
+
+    private static AgreementEventType ParseEventType(string rawType) => rawType switch
+    {
+        "sign" => AgreementEventType.Sign,
+        "revokeAmendment" => AgreementEventType.RevokeAmendment,
+        "revokeAgreement" => AgreementEventType.RevokeAgreement,
+        "removeParty" => AgreementEventType.RemoveParty,
+        "revokeSignedFact" => AgreementEventType.RevokeSignedFact,
+        _ => AgreementEventType.Unknown,
+    };
 
     /// <summary>Parses and audits an agreement package supplied as JSON.</summary>
     /// <param name="json">The raw JSON package.</param>
@@ -550,6 +684,113 @@ public sealed class AgreementAuditor
         return obligations.OrderBy(o => o.ClauseId, StringComparer.Ordinal).ToList();
     }
 
+    /// <summary>
+    /// Folds the ordered event log over the base package to produce the effective signing and
+    /// participation state. Events are applied strictly in ascending <see cref="AgreementEvent.Sequence"/>
+    /// order (with a stable secondary tie-break by source index only when two events share a sequence),
+    /// so the outcome depends solely on the material-defined sequence numbers, never on the order in
+    /// which entries happen to arrive in the array. A revoke-signed-fact event does not erase a prior
+    /// signing — history is immutable — so it leaves <see cref="EffectiveState.EffectiveSignatures"/>
+    /// untouched (the accompanying audit issue is raised separately by <see cref="Audit"/>).
+    /// </summary>
+    /// <param name="agreement">The agreement package.</param>
+    /// <returns>The deterministic <see cref="EffectiveState"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="agreement"/> is null.</exception>
+    public EffectiveState ComputeEffectiveState(MediationAgreement agreement)
+    {
+        if (agreement is null) throw new ArgumentNullException(nameof(agreement));
+
+        var activeParties = new HashSet<string>(agreement.Parties.Select(p => p.Id), StringComparer.Ordinal);
+        var revokedAmendments = new HashSet<string>(StringComparer.Ordinal);
+        // Amendments already statically withdrawn count as revoked from the start.
+        foreach (var amendment in agreement.Amendments)
+            if (amendment.Withdrawn)
+                revokedAmendments.Add(amendment.Id);
+
+        bool agreementRevoked = false;
+        var signatures = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        // Seed with the statically recorded signatures: these are established facts before any event.
+        foreach (var signature in agreement.Signatures)
+        {
+            if (!activeParties.Contains(signature.PartyId)) continue;
+            if (!signatures.TryGetValue(signature.PartyId, out var seed))
+                signatures[signature.PartyId] = seed = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var scope in signature.Scope)
+                seed.Add(scope);
+        }
+
+        foreach (var evt in OrderedEvents(agreement))
+        {
+            switch (evt.Type)
+            {
+                case AgreementEventType.Sign:
+                    if (evt.PartyId is not null && evt.Scope is not null && activeParties.Contains(evt.PartyId))
+                    {
+                        if (!signatures.TryGetValue(evt.PartyId, out var scopes))
+                            signatures[evt.PartyId] = scopes = new HashSet<string>(StringComparer.Ordinal);
+                        scopes.Add(evt.Scope);
+                    }
+                    break;
+
+                case AgreementEventType.RevokeAmendment:
+                    if (evt.AmendmentId is not null)
+                        revokedAmendments.Add(evt.AmendmentId);
+                    break;
+
+                case AgreementEventType.RevokeAgreement:
+                    agreementRevoked = true;
+                    break;
+
+                case AgreementEventType.RemoveParty:
+                    if (evt.PartyId is not null)
+                    {
+                        activeParties.Remove(evt.PartyId);
+                        signatures.Remove(evt.PartyId);
+                    }
+                    break;
+
+                case AgreementEventType.RevokeSignedFact:
+                    // Deliberately a no-op on state: a signed fact cannot be rewritten. The audit
+                    // surfaces MED_SIGNED_FACT_REVOCATION_ATTEMPT so the attempt is visible.
+                    break;
+
+                case AgreementEventType.Unknown:
+                default:
+                    break;
+            }
+        }
+
+        var effectiveSignatures = signatures
+            .Where(kv => activeParties.Contains(kv.Key))
+            .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+            .ToDictionary(
+                kv => kv.Key,
+                kv => (IReadOnlyList<string>)kv.Value.OrderBy(s => s, StringComparer.Ordinal).ToList(),
+                StringComparer.Ordinal);
+
+        return new EffectiveState(
+            agreementRevoked,
+            activeParties.OrderBy(p => p, StringComparer.Ordinal).ToList(),
+            revokedAmendments.OrderBy(a => a, StringComparer.Ordinal).ToList(),
+            effectiveSignatures);
+    }
+
+    /// <summary>
+    /// Returns the event log in the authoritative application order: ascending sequence number, then
+    /// (only to break exact sequence ties) a stable logical content key. Ordering never consults the
+    /// array/arrival position, so the fold is identical whether the same package is submitted once,
+    /// twice, or with its <c>$.events</c> array reordered. Genuine same-sequence ties are additionally
+    /// reported as <see cref="MediationIssueCodes.EventSequenceConflict"/>.
+    /// </summary>
+    private static IReadOnlyList<AgreementEvent> OrderedEvents(MediationAgreement agreement) =>
+        agreement.Events
+            .OrderBy(e => e.Sequence)
+            .ThenBy(e => EventTieBreakKey(e), StringComparer.Ordinal)
+            .ToList();
+
+    private static string EventTieBreakKey(AgreementEvent e) =>
+        string.Join("\u0000", (int)e.Type, e.PartyId ?? "", e.AmendmentId ?? "", e.Scope ?? "");
+
     /// <summary>Runs every consistency check against a parsed agreement package.</summary>
     /// <param name="agreement">The agreement package to audit.</param>
     /// <returns>The deterministic <see cref="AuditResult"/>.</returns>
@@ -581,6 +822,7 @@ public sealed class AgreementAuditor
         CheckDateOrder(agreement, clauseById, issues);
         CheckSignatureScope(agreement, validLiveAmendments, issues);
         CheckWithdrawnReferenced(agreement, clauseById, issues);
+        CheckEvents(agreement, issues);
 
         issues.Sort(CompareIssues);
         return new AuditResult(issues);
@@ -973,6 +1215,115 @@ public sealed class AgreementAuditor
         }
     }
 
+    /// <summary>
+    /// Audits the ordered event log. Three families of findings are emitted, all with evidence paths
+    /// anchored on the raw <c>$.events[i]</c> entry and position-independent sort keys derived from the
+    /// event sequence number:
+    /// <list type="bullet">
+    /// <item>MED_SIGNED_FACT_REVOCATION_ATTEMPT — a revoke-signed-fact event targets a party/scope that
+    /// was actually signed (by a static signature or by an earlier-sequence sign event). History is
+    /// preserved; only the attempt is reported.</item>
+    /// <item>MED_EVENT_TARGET_UNKNOWN — an event names a party, amendment or agreement id absent from the package.</item>
+    /// <item>MED_EVENT_SEQUENCE_CONFLICT — two or more events share the same sequence number.</item>
+    /// </list>
+    /// </summary>
+    private static void CheckEvents(
+        MediationAgreement agreement,
+        List<AuditIssue> issues)
+    {
+        if (agreement.Events.Count == 0) return;
+
+        var partyIds = new HashSet<string>(agreement.Parties.Select(p => p.Id), StringComparer.Ordinal);
+        var amendmentIds = new HashSet<string>(agreement.Amendments.Select(a => a.Id), StringComparer.Ordinal);
+
+        // The set of (party, scope) facts that are actually signed, considering both static signatures
+        // and every sign event, is independent of event order — it is a union — so it is safe to build
+        // up front and query for revoke-signed-fact attempts.
+        var signedFacts = new HashSet<(string party, string scope)>();
+        foreach (var signature in agreement.Signatures)
+            foreach (var scope in signature.Scope)
+                signedFacts.Add((signature.PartyId, scope));
+        foreach (var evt in agreement.Events)
+            if (evt.Type == AgreementEventType.Sign && evt.PartyId is not null && evt.Scope is not null)
+                signedFacts.Add((evt.PartyId, evt.Scope));
+
+        // Sequence conflicts: report every event that shares its sequence with another (the whole
+        // colliding group), anchored per-event so evidence is precise.
+        var bySequence = agreement.Events.GroupBy(e => e.Sequence);
+        foreach (var group in bySequence)
+        {
+            if (group.Count() < 2) continue;
+            foreach (var evt in group)
+            {
+                issues.Add(new AuditIssue(
+                    MediationIssueCodes.EventSequenceConflict,
+                    Severity.Error,
+                    $"Event at sequence {evt.Sequence} shares its sequence number with another event, making their order ambiguous.",
+                    $"$.events[{evt.SourceIndex}].seq",
+                    EvidenceScope.Events,
+                    evt.SourceIndex,
+                    -1,
+                    "seq",
+                    $"{evt.Sequence:D19}\u0000{EventTieBreakKey(evt)}"));
+            }
+        }
+
+        foreach (var evt in agreement.Events)
+        {
+            switch (evt.Type)
+            {
+                case AgreementEventType.RevokeSignedFact:
+                    // Only a genuine attempt to erase an existing signed fact is reported; a
+                    // revoke-signed-fact for something never signed is a plain unknown target.
+                    if (evt.PartyId is not null && evt.Scope is not null
+                        && signedFacts.Contains((evt.PartyId, evt.Scope)))
+                    {
+                        issues.Add(new AuditIssue(
+                            MediationIssueCodes.SignedFactRevocationAttempt,
+                            Severity.Error,
+                            $"Event tries to revoke the recorded fact that '{evt.PartyId}' signed '{evt.Scope}'; signing history is immutable and is preserved.",
+                            $"$.events[{evt.SourceIndex}]",
+                            EvidenceScope.Events,
+                            evt.SourceIndex,
+                            -1,
+                            "",
+                            $"{evt.PartyId}\u0000{evt.Scope}\u0000{evt.Sequence:D19}"));
+                    }
+                    break;
+            }
+
+            // Unknown-target detection for every event kind that names an id.
+            string? unknownDetail = null;
+            if (evt.PartyId is not null
+                && (evt.Type is AgreementEventType.Sign or AgreementEventType.RemoveParty
+                    or AgreementEventType.RevokeSignedFact)
+                && !partyIds.Contains(evt.PartyId))
+            {
+                unknownDetail = $"party '{evt.PartyId}'";
+            }
+            else if (evt.AmendmentId is not null
+                && evt.Type == AgreementEventType.RevokeAmendment
+                && !amendmentIds.Contains(evt.AmendmentId))
+            {
+                unknownDetail = $"amendment '{evt.AmendmentId}'";
+            }
+
+            if (unknownDetail is not null)
+            {
+                issues.Add(new AuditIssue(
+                    MediationIssueCodes.EventTargetUnknown,
+                    Severity.Error,
+                    $"Event references {unknownDetail}, which does not exist in the package.",
+                    $"$.events[{evt.SourceIndex}]",
+                    EvidenceScope.Events,
+                    evt.SourceIndex,
+                    -1,
+                    "",
+                    $"{evt.Sequence:D19}\u0000{EventTieBreakKey(evt)}"));
+            }
+        }
+    }
+
     // ----- cycle detection (iterative Tarjan SCC) ----------------------------------------------
 
     private static void CheckReferenceCycles(
@@ -1268,6 +1619,18 @@ public static class Program
         Console.WriteLine();
         Console.WriteLine($"Effective clause versions: {string.Join(", ", chain.EffectiveClauseIds())}");
         Console.WriteLine();
+
+        var state = auditor.ComputeEffectiveState(agreement);
+        if (agreement.Events.Count > 0)
+        {
+            Console.WriteLine("Effective state after folding events (by sequence):");
+            Console.WriteLine($"  agreement revoked : {state.AgreementRevoked}");
+            Console.WriteLine($"  active parties    : {string.Join(", ", state.ActiveParties)}");
+            Console.WriteLine($"  revoked amendments: {(state.RevokedAmendmentIds.Count == 0 ? "(none)" : string.Join(", ", state.RevokedAmendmentIds))}");
+            foreach (var kv in state.EffectiveSignatures)
+                Console.WriteLine($"  signed [{kv.Key}]    : {string.Join(", ", kv.Value)}");
+            Console.WriteLine();
+        }
 
         Console.WriteLine($"Issues found: {result.Issues.Count}");
         Console.WriteLine();
