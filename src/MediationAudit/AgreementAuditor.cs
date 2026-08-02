@@ -17,7 +17,10 @@ public static class IssueCodes
     /// <summary>补充协议声明要替换的条款不存在，或该条款由已撤回/未生效的补充协议产生。</summary>
     public const string AmendmentTargetUnknown = "MED_AMENDMENT_TARGET_UNKNOWN";
 
-    /// <summary>两份生效补充协议替换同一条款，后出现的补充协议构成重复替换。</summary>
+    /// <summary>
+    /// 修订关系冲突：两份生效补充协议并发替换同一条款（分叉）、多份补充协议的产物占用同一编号（汇聚），
+    /// 或补充协议未提供新编号而试图就地修改。
+    /// </summary>
     public const string AmendmentConflict = "MED_AMENDMENT_CONFLICT";
 
     /// <summary>协议声明的金额总额与全部生效条款金额之和不一致。</summary>
@@ -26,7 +29,7 @@ public static class IssueCodes
     /// <summary>条款的履行日期早于其所依赖（引用）条款的生效履行日期。</summary>
     public const string DateOrder = "MED_DATE_ORDER";
 
-    /// <summary>条款引用关系在生效图上构成有向环。</summary>
+    /// <summary>有向环：条款引用关系在生效图上构成环，或补充协议替换关系在版本链上构成环（替换环）。</summary>
     public const string ReferenceCycle = "MED_REFERENCE_CYCLE";
 
     /// <summary>当事人的签署范围缺少协议本体或某份已生效补充协议。</summary>
@@ -49,6 +52,24 @@ public enum IssueSeverity
 
     /// <summary>明确的一致性问题。</summary>
     Error = 1,
+}
+
+/// <summary>
+/// 版本链中某个条款版本的状态。
+/// </summary>
+public enum VersionStatus
+{
+    /// <summary>当前有效版本，参与金额、日期、签署等全部一致性检查。</summary>
+    Effective = 0,
+
+    /// <summary>已被唯一后继版本替换的旧版本。版本被保留在版本链中，不会被物理删除。</summary>
+    Superseded = 1,
+
+    /// <summary>
+    /// 未决版本：处于替换分叉、产物编号冲突或替换环中，生效性无法唯一确定，
+    /// 不参与一致性检查，等待工作人员裁决。
+    /// </summary>
+    Contested = 2,
 }
 
 /// <summary>
@@ -94,18 +115,42 @@ public sealed class Clause
 }
 
 /// <summary>
-/// 补充协议。对应 JSON 中 <c>amendments</c> 数组的元素；
-/// 生效时将 <see cref="Replaces"/> 指定的条款替换为编号为 <see cref="NewClauseId"/> 的新条款。
+/// 补充协议追加的新条款。对应 JSON 中 <c>amendments[i].appends</c> 对象，字段形状与基础条款一致。
+/// </summary>
+public sealed class AppendedClause
+{
+    /// <summary>新条款编号，不得与任何已有版本编号重复。</summary>
+    public required string Id { get; init; }
+
+    /// <summary>义务人（当事人编号）。</summary>
+    public string? ObligorId { get; init; }
+
+    /// <summary>金额（分）。</summary>
+    public long? AmountFen { get; init; }
+
+    /// <summary>履行日期（yyyy-MM-dd）。</summary>
+    public DateOnly? Due { get; init; }
+
+    /// <summary>该条款依赖（引用）的其他条款编号。</summary>
+    public IReadOnlyList<string> References { get; init; } = Array.Empty<string>();
+}
+
+/// <summary>
+/// 补充协议。对应 JSON 中 <c>amendments</c> 数组的元素。
+/// 两种形态：<see cref="Replaces"/> 非空表示替换（修订）既有条款；<see cref="Appends"/> 非空表示追加新条款。
 /// </summary>
 public sealed class Amendment
 {
     /// <summary>补充协议编号，在协议包内唯一。</summary>
     public required string Id { get; init; }
 
-    /// <summary>被替换的条款编号（可以是基础条款，也可以是先前补充协议产生的条款）。</summary>
-    public required string Replaces { get; init; }
+    /// <summary>被替换的条款编号（可以是基础条款，也可以是先前补充协议产生的条款）；追加形态下为 <c>null</c>。</summary>
+    public string? Replaces { get; init; }
 
-    /// <summary>替换后新条款的编号；缺省时表示就地修改原条款。</summary>
+    /// <summary>
+    /// 替换后新条款的编号；必须是一个未占用的新编号。不允许就地修改：
+    /// 缺省或与已有编号重复都会被判为 <see cref="IssueCodes.AmendmentConflict"/>。
+    /// </summary>
     public string? NewClauseId { get; init; }
 
     /// <summary>替换后的金额（分）；为 <c>null</c> 时继承被替换条款的金额。</summary>
@@ -114,7 +159,10 @@ public sealed class Amendment
     /// <summary>替换后的履行日期；为 <c>null</c> 时继承被替换条款的履行日期。</summary>
     public DateOnly? Due { get; init; }
 
-    /// <summary>是否已撤回。已撤回的补充协议不产生任何替换效果，也不要求被签署。</summary>
+    /// <summary>追加的新条款；与 <see cref="Replaces"/> 互斥。</summary>
+    public AppendedClause? Appends { get; init; }
+
+    /// <summary>是否已撤回。已撤回的补充协议不产生任何版本，也不要求被签署。</summary>
     public bool Withdrawn { get; init; }
 }
 
@@ -148,7 +196,7 @@ public sealed class Agreement
     /// <summary>基础条款列表。</summary>
     public IReadOnlyList<Clause> Clauses { get; init; } = Array.Empty<Clause>();
 
-    /// <summary>补充协议列表，按声明顺序依次生效。</summary>
+    /// <summary>补充协议列表。审计语义与数组顺序无关：交换顺序不改变有效条款视图与问题输出。</summary>
     public IReadOnlyList<Amendment> Amendments { get; init; } = Array.Empty<Amendment>();
 
     /// <summary>签署记录列表。</summary>
@@ -328,8 +376,7 @@ public sealed class Agreement
                 }
 
                 string? id = GetString(el, "id");
-                string? replaces = GetString(el, "replaces");
-                if (id is null || replaces is null)
+                if (id is null)
                 {
                     continue;
                 }
@@ -337,10 +384,11 @@ public sealed class Agreement
                 list.Add(new Amendment
                 {
                     Id = id,
-                    Replaces = replaces,
+                    Replaces = GetString(el, "replaces"),
                     NewClauseId = GetString(el, "newClauseId"),
                     AmountFen = GetInt64(el, "amountFen"),
                     Due = GetDate(el, "due"),
+                    Appends = ParseAppends(el),
                     Withdrawn = TryGetProperty(el, "withdrawn", out JsonElement w)
                         && (w.ValueKind == JsonValueKind.True || w.ValueKind == JsonValueKind.False)
                         && w.GetBoolean(),
@@ -349,6 +397,29 @@ public sealed class Agreement
         }
 
         return list;
+    }
+
+    private static AppendedClause? ParseAppends(JsonElement amendment)
+    {
+        if (!TryGetProperty(amendment, "appends", out JsonElement el) || el.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        string? id = GetString(el, "id");
+        if (id is null)
+        {
+            return null;
+        }
+
+        return new AppendedClause
+        {
+            Id = id,
+            ObligorId = GetString(el, "obligor"),
+            AmountFen = GetInt64(el, "amountFen"),
+            Due = GetDate(el, "due"),
+            References = GetStringArray(el, "references"),
+        };
     }
 
     private static IReadOnlyList<Signature> ParseSignatures(JsonElement root)
@@ -412,12 +483,77 @@ public sealed class AuditIssue
     /// <summary>
     /// 指向原始输入 JSON 的证据路径，格式为 <c>$.clauses[0].due</c>、<c>$.amendments[1].replaces</c> 等，
     /// 数组下标一律对应原始 JSON 中的位置。该路径在原始 JSON 中必定可以解析到具体节点。
+    /// 分叉与替换环等结构性问题取所有候选路径中最短（段数最少）、再按字典序最小的一条，保证稳定。
     /// </summary>
     public required string EvidencePath { get; init; }
 }
 
 /// <summary>
-/// 审计结果：协议编号与按稳定顺序排列的全部问题。
+/// 版本链中的一个条款版本：基础条款、替换产物或追加产物。旧版本始终保留，不会被物理删除。
+/// </summary>
+public sealed class ClauseVersion
+{
+    /// <summary>条款编号（复用基础条款与补充协议声明的编号）。</summary>
+    public required string Id { get; init; }
+
+    /// <summary>该版本在原始 JSON 中的出处，如 <c>$.clauses[0]</c>、<c>$.amendments[2]</c>、<c>$.amendments[1].appends</c>。</summary>
+    public required string OriginPath { get; init; }
+
+    /// <summary>版本状态（有效/已被替换/未决）。</summary>
+    public required VersionStatus Status { get; init; }
+
+    /// <summary>解析继承后的义务人。</summary>
+    public string? ObligorId { get; init; }
+
+    /// <summary>解析继承后的金额（分）。</summary>
+    public long? AmountFen { get; init; }
+
+    /// <summary>解析继承后的履行日期。</summary>
+    public DateOnly? Due { get; init; }
+
+    /// <summary>解析继承后的引用目标编号列表。</summary>
+    public IReadOnlyList<string> References { get; init; } = Array.Empty<string>();
+}
+
+/// <summary>
+/// 版本链中的一条修订边：补充协议把 <see cref="FromId"/> 版本替换为 <see cref="ToId"/> 版本。
+/// </summary>
+public sealed class RevisionLink
+{
+    /// <summary>产生该修订的补充协议编号。</summary>
+    public required string AmendmentId { get; init; }
+
+    /// <summary>被替换版本的条款编号。</summary>
+    public required string FromId { get; init; }
+
+    /// <summary>替换产物版本的条款编号。</summary>
+    public required string ToId { get; init; }
+
+    /// <summary>该修订关系在原始 JSON 中的证据路径（<c>$.amendments[i].replaces</c>）。</summary>
+    public required string EvidencePath { get; init; }
+
+    /// <summary>该修订是否实际生效（分叉、替换环、编号冲突或目标未知时为 <c>false</c>）。</summary>
+    public required bool Applied { get; init; }
+}
+
+/// <summary>
+/// 可审计的有向版本链：全部条款版本（含已被替换与未决版本）与全部修订边。
+/// 结构只依赖协议包内容，与补充协议数组顺序无关。
+/// </summary>
+public sealed class VersionChain
+{
+    /// <summary>全部条款版本，按文档顺序排列；旧版本保留，不物理删除。</summary>
+    public required IReadOnlyList<ClauseVersion> Versions { get; init; }
+
+    /// <summary>全部修订边（替换关系），按文档顺序排列。</summary>
+    public required IReadOnlyList<RevisionLink> Revisions { get; init; }
+
+    /// <summary>有效条款视图：状态为 <see cref="VersionStatus.Effective"/> 的版本子集，按文档顺序排列。</summary>
+    public required IReadOnlyList<ClauseVersion> EffectiveVersions { get; init; }
+}
+
+/// <summary>
+/// 审计结果：协议编号、按稳定顺序排列的全部问题，以及审计所用的有向版本链。
 /// </summary>
 public sealed class AuditResult
 {
@@ -429,6 +565,9 @@ public sealed class AuditResult
     /// 与说明文案、JSON 字段顺序及图遍历顺序无关；同一输入重复审计结果完全一致。
     /// </summary>
     public required IReadOnlyList<AuditIssue> Issues { get; init; }
+
+    /// <summary>审计所依据的有向版本链，可供工作人员逐版本、逐修订边复核。</summary>
+    public required VersionChain Versions { get; init; }
 
     /// <summary>将审计结果序列化为确定性的 JSON 文本（两空格缩进，问题按稳定顺序排列）。</summary>
     /// <returns>JSON 文本。</returns>
@@ -456,6 +595,38 @@ public sealed class AuditResult
             }
 
             writer.WriteEndArray();
+            writer.WriteStartArray("effectiveVersions");
+            foreach (ClauseVersion v in Versions.EffectiveVersions)
+            {
+                writer.WriteStartObject();
+                writer.WriteString("id", v.Id);
+                writer.WriteString("originPath", v.OriginPath);
+                if (v.ObligorId is not null)
+                {
+                    writer.WriteString("obligor", v.ObligorId);
+                }
+
+                if (v.AmountFen is not null)
+                {
+                    writer.WriteNumber("amountFen", v.AmountFen.Value);
+                }
+
+                if (v.Due is not null)
+                {
+                    writer.WriteString("due", v.Due.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+                }
+
+                writer.WriteStartArray("references");
+                foreach (string r in v.References)
+                {
+                    writer.WriteStringValue(r);
+                }
+
+                writer.WriteEndArray();
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
             writer.WriteEndObject();
         }
 
@@ -464,8 +635,9 @@ public sealed class AuditResult
 }
 
 /// <summary>
-/// 调解协议一致性审计器。所有图遍历（引用链追踪、有向环检测）均以显式栈迭代实现，
-/// 任意深度的引用链与随机协议图都不会导致栈溢出；审计过程无副作用，结果完全确定。
+/// 调解协议一致性审计器。修订关系被建模为有向版本链（DAG），替换、追加、分叉、汇聚与
+/// 替换环都以声明式规则判定，语义与补充协议数组顺序无关；所有图遍历（引用链追踪、
+/// 环检测）均以显式栈迭代实现，任意深度的引用链与随机协议图都不会导致栈溢出。
 /// </summary>
 public static class AgreementAuditor
 {
@@ -478,7 +650,7 @@ public static class AgreementAuditor
     public static AuditResult Audit(string json) => Audit(Agreement.Parse(json));
 
     /// <summary>
-    /// 对协议包执行全部一致性检查：悬空引用、补充协议替换、签署范围、金额一致性、
+    /// 对协议包执行全部一致性检查：先构建有向版本链，再检查悬空引用、签署范围、金额一致性、
     /// 履行日期顺序与引用环。返回的问题按（代码, 证据路径）稳定排序并去重。
     /// </summary>
     /// <param name="agreement">解析后的协议包。</param>
@@ -490,28 +662,17 @@ public static class AgreementAuditor
         return engine.Run();
     }
 
-    /// <summary>生效条款：基础条款经生效补充协议替换后的视图，同时记录每个取值在原始 JSON 中的出处。</summary>
-    private sealed class EffectiveClause
+    /// <summary>
+    /// 仅构建可审计的有向版本链，不执行一致性检查。结构性问题（分叉、替换环、编号冲突）
+    /// 通过 <see cref="VersionStatus.Contested"/> 与 <see cref="RevisionLink.Applied"/> 反映。
+    /// </summary>
+    /// <param name="agreement">解析后的协议包。</param>
+    /// <returns>有向版本链。</returns>
+    public static VersionChain BuildVersionChain(Agreement agreement)
     {
-        public required string Id { get; init; }
-
-        public string? ObligorId { get; set; }
-
-        /// <summary>义务人取值在原始 JSON 中的路径（始终来自基础条款）。</summary>
-        public string? ObligorPath { get; set; }
-
-        public long? AmountFen { get; set; }
-
-        public DateOnly? Due { get; set; }
-
-        /// <summary>履行日期取值在原始 JSON 中的路径（来自基础条款或补充协议）。</summary>
-        public string? DuePath { get; set; }
-
-        /// <summary>引用边（原始目标编号 + 原始 JSON 路径），随替换沿继承关系保留。</summary>
-        public List<RefEdge> Refs { get; } = new();
-
-        /// <summary>文档顺序：基础条款在前，补充协议产生的条款在后。</summary>
-        public int Order { get; init; }
+        ArgumentNullException.ThrowIfNull(agreement);
+        var builder = new ChainBuilder(agreement, static (_, _, _, _) => { });
+        return builder.Build().ToPublicChain();
     }
 
     /// <summary>一条引用边：引用方写下的原始目标编号，以及它在原始 JSON 中的位置。</summary>
@@ -528,29 +689,656 @@ public static class AgreementAuditor
         public string Path { get; }
     }
 
+    /// <summary>版本链内部节点：记录自身覆写值与出处，继承值沿父链解析。</summary>
+    private sealed class VersionNode
+    {
+        public required string Id { get; init; }
+
+        public required string OriginPath { get; init; }
+
+        /// <summary>文档顺序：基础条款在前，其后按补充协议数组顺序排列。</summary>
+        public required int Order { get; init; }
+
+        public string? OwnObligorId { get; init; }
+
+        public string? OwnObligorPath { get; init; }
+
+        public long? OwnAmountFen { get; init; }
+
+        public DateOnly? OwnDue { get; init; }
+
+        public string? OwnDuePath { get; init; }
+
+        /// <summary>自有引用（基础条款与追加条款）；替换产物为 <c>null</c>，沿父链继承。</summary>
+        public List<RefEdge>? OwnRefs { get; init; }
+
+        /// <summary>替换来源（修订边起点）；基础条款与追加条款为 <c>null</c>。</summary>
+        public VersionNode? Parent { get; set; }
+
+        /// <summary>产生该版本的补充协议编号；基础条款为 <c>null</c>。</summary>
+        public string? ProducedBy { get; init; }
+
+        /// <summary>该版本编号在原始 JSON 中的出处（如 <c>$.clauses[0].id</c>、<c>$.amendments[1].newClauseId</c>）。</summary>
+        public required string IdPath { get; init; }
+
+        /// <summary>是否追加产物（追加条款无修订边来源）。</summary>
+        public bool IsAppend { get; init; }
+
+        public List<RevisionEdge> Out { get; } = new();
+
+        public bool Contested { get; set; }
+
+        public VersionStatus Status { get; set; } = VersionStatus.Effective;
+    }
+
+    /// <summary>版本链内部修订边。</summary>
+    private sealed class RevisionEdge
+    {
+        public required VersionNode Source { get; init; }
+
+        public required VersionNode Target { get; init; }
+
+        public required string AmendmentId { get; init; }
+
+        /// <summary><c>$.amendments[i].replaces</c>。</summary>
+        public required string ReplacesPath { get; init; }
+
+        /// <summary><c>$.amendments[i].newClauseId</c>（产物编号出处）。</summary>
+        public required string NewClauseIdPath { get; init; }
+
+        public required int AmendmentIndex { get; init; }
+
+        public bool Applied { get; set; }
+    }
+
+    /// <summary>
+    /// 有向版本链构建器。分阶段声明式构建：先创建全部版本节点，再连接修订边，
+    /// 最后统一判定分叉、替换环与编号汇聚——因此语义与补充协议数组顺序无关。
+    /// </summary>
+    private sealed class ChainBuilder
+    {
+        private readonly Agreement _agreement;
+        private readonly Action<string, IssueSeverity, string, string> _emit;
+        private readonly List<VersionNode> _nodes = new();
+        private readonly Dictionary<string, VersionNode> _canonical = new(StringComparer.Ordinal);
+        private readonly List<RevisionEdge> _edges = new();
+
+        public ChainBuilder(Agreement agreement, Action<string, IssueSeverity, string, string> emit)
+        {
+            _agreement = agreement;
+            _emit = emit;
+        }
+
+        public BuiltChain Build()
+        {
+            CreateBaseNodes();
+            CreateProductNodes();
+            ConnectEdges();
+            FlagConvergences();
+            FlagForks();
+            FlagCycles();
+            PropagateContested();
+            ComputeStatuses();
+            return new BuiltChain(_agreement, _nodes, _canonical, _edges);
+        }
+
+        private void AddNode(VersionNode node)
+        {
+            _nodes.Add(node);
+            // 同一编号可能有多个版本（编号冲突时）；规范节点取文档顺序最先者，用于引用解析起点。
+            if (!_canonical.ContainsKey(node.Id))
+            {
+                _canonical.Add(node.Id, node);
+            }
+        }
+
+        private void CreateBaseNodes()
+        {
+            for (int i = 0; i < _agreement.Clauses.Count; i++)
+            {
+                Clause c = _agreement.Clauses[i];
+                if (_canonical.ContainsKey(c.Id))
+                {
+                    continue; // 基础条款编号重复时以先出现者为准，行为确定。
+                }
+
+                var refs = new List<RefEdge>();
+                for (int j = 0; j < c.References.Count; j++)
+                {
+                    refs.Add(new RefEdge(c.References[j], $"$.clauses[{i}].references[{j}]"));
+                }
+
+                AddNode(new VersionNode
+                {
+                    Id = c.Id,
+                    OriginPath = $"$.clauses[{i}]",
+                    Order = i,
+                    OwnObligorId = c.Obligation.ObligorId,
+                    OwnObligorPath = c.Obligation.ObligorId is null ? null : $"$.clauses[{i}].obligor",
+                    OwnAmountFen = c.Obligation.AmountFen,
+                    OwnDue = c.Obligation.Due,
+                    OwnDuePath = c.Obligation.Due is null ? null : $"$.clauses[{i}].due",
+                    OwnRefs = refs,
+                    IdPath = $"$.clauses[{i}].id",
+                });
+            }
+        }
+
+        private void CreateProductNodes()
+        {
+            for (int i = 0; i < _agreement.Amendments.Count; i++)
+            {
+                Amendment a = _agreement.Amendments[i];
+                if (a.Withdrawn)
+                {
+                    continue; // 已撤回：不产生任何版本，也不要求签署。
+                }
+
+                if (a.Replaces is not null)
+                {
+                    if (string.IsNullOrEmpty(a.NewClauseId))
+                    {
+                        _emit(
+                            IssueCodes.AmendmentConflict,
+                            IssueSeverity.Error,
+                            $"补充协议 '{a.Id}' 未提供 newClauseId；不允许就地修改条款 '{a.Replaces}'。",
+                            $"$.amendments[{i}].replaces");
+                        continue;
+                    }
+
+                    // 编号冲突（汇聚/撞号）不阻止建点：版本保留，统一在 FlagConvergences 判定。
+                    AddNode(new VersionNode
+                    {
+                        Id = a.NewClauseId!,
+                        OriginPath = $"$.amendments[{i}]",
+                        Order = _agreement.Clauses.Count + i,
+                        OwnAmountFen = a.AmountFen,
+                        OwnDue = a.Due,
+                        OwnDuePath = a.Due is null ? null : $"$.amendments[{i}].due",
+                        ProducedBy = a.Id,
+                        IdPath = $"$.amendments[{i}].newClauseId",
+                    });
+                }
+
+                if (a.Appends is not null)
+                {
+                    AppendedClause app = a.Appends;
+                    var refs = new List<RefEdge>();
+                    for (int j = 0; j < app.References.Count; j++)
+                    {
+                        refs.Add(new RefEdge(app.References[j], $"$.amendments[{i}].appends.references[{j}]"));
+                    }
+
+                    AddNode(new VersionNode
+                    {
+                        Id = app.Id,
+                        OriginPath = $"$.amendments[{i}].appends",
+                        Order = _agreement.Clauses.Count + i,
+                        OwnObligorId = app.ObligorId,
+                        OwnObligorPath = app.ObligorId is null ? null : $"$.amendments[{i}].appends.obligor",
+                        OwnAmountFen = app.AmountFen,
+                        OwnDue = app.Due,
+                        OwnDuePath = app.Due is null ? null : $"$.amendments[{i}].appends.due",
+                        OwnRefs = refs,
+                        ProducedBy = a.Id,
+                        IdPath = $"$.amendments[{i}].appends.id",
+                        IsAppend = true,
+                    });
+                }
+            }
+        }
+
+        private void ConnectEdges()
+        {
+            for (int i = 0; i < _agreement.Amendments.Count; i++)
+            {
+                Amendment a = _agreement.Amendments[i];
+                if (a.Withdrawn || a.Replaces is null || string.IsNullOrEmpty(a.NewClauseId))
+                {
+                    continue;
+                }
+
+                if (!_canonical.TryGetValue(a.Replaces, out VersionNode? source))
+                {
+                    _emit(
+                        IssueCodes.AmendmentTargetUnknown,
+                        IssueSeverity.Error,
+                        $"补充协议 '{a.Id}' 要替换的条款 '{a.Replaces}' 不存在（或产生它的补充协议已撤回）。",
+                        $"$.amendments[{i}].replaces");
+
+                    // 替换落空的产物版本保留在链中但标记未决：不进入有效视图，也不物理删除。
+                    _nodes.First(n => n.ProducedBy == a.Id && n.Order == _agreement.Clauses.Count + i).Contested = true;
+                    continue;
+                }
+
+                // 产物节点一定存在（CreateProductNodes 已无条件创建，包括撞号节点）。
+                VersionNode target = _nodes.First(n =>
+                    n.ProducedBy == a.Id && n.Order == _agreement.Clauses.Count + i);
+                var edge = new RevisionEdge
+                {
+                    Source = source,
+                    Target = target,
+                    AmendmentId = a.Id,
+                    ReplacesPath = $"$.amendments[{i}].replaces",
+                    NewClauseIdPath = $"$.amendments[{i}].newClauseId",
+                    AmendmentIndex = i,
+                };
+                source.Out.Add(edge);
+                target.Parent = source;
+                _edges.Add(edge);
+            }
+        }
+
+        /// <summary>编号汇聚：同一编号被多个版本占用（多份补充协议产物撞号，或产物撞上基础条款）。</summary>
+        private void FlagConvergences()
+        {
+            foreach (IGrouping<string, VersionNode> group in _nodes.GroupBy(n => n.Id).Where(g => g.Count() > 1))
+            {
+                List<VersionNode> members = group.OrderBy(n => n.Order).ToList();
+                foreach (VersionNode node in members)
+                {
+                    node.Contested = true;
+                }
+
+                // 证据：相关补充协议产物编号出处（newClauseId / appends.id）中最短、最小的一条。
+                List<string> paths = members
+                    .Where(n => n.ProducedBy is not null)
+                    .Select(n => n.IdPath)
+                    .ToList();
+                if (paths.Count > 0)
+                {
+                    string ids = string.Join("、", members.Where(n => n.ProducedBy is not null).Select(n => $"'{n.ProducedBy}'").OrderBy(s => s, StringComparer.Ordinal));
+                    _emit(
+                        IssueCodes.AmendmentConflict,
+                        IssueSeverity.Error,
+                        $"条款编号 '{group.Key}' 被多份补充协议（{ids}）的产物占用，相关版本均为未决。",
+                        MinEvidencePath(paths));
+                }
+            }
+        }
+
+        /// <summary>分叉：同一版本被两份及以上补充协议并发替换。分叉源保持有效，全部分支未决。</summary>
+        private void FlagForks()
+        {
+            foreach (VersionNode node in _nodes)
+            {
+                if (node.Out.Count < 2)
+                {
+                    continue;
+                }
+
+                foreach (RevisionEdge edge in node.Out)
+                {
+                    edge.Target.Contested = true;
+                }
+
+                string ids = string.Join("、", node.Out.Select(e => $"'{e.AmendmentId}'").OrderBy(s => s, StringComparer.Ordinal));
+                _emit(
+                    IssueCodes.AmendmentConflict,
+                    IssueSeverity.Error,
+                    $"条款 '{node.Id}' 被补充协议 {ids} 并发替换，产生分叉；裁决前 '{node.Id}' 保持为有效版本。",
+                    MinEvidencePath(node.Out.Select(e => e.ReplacesPath)));
+            }
+        }
+
+        /// <summary>替换环：把修订边投影到条款编号图上（同编号版本视为同一节点）检测有向环。环上版本全部未决。</summary>
+        private void FlagCycles()
+        {
+            // 编号按文档首次出现顺序排列，保证遍历顺序固定。
+            var ids = new List<string>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (VersionNode node in _nodes)
+            {
+                if (seen.Add(node.Id))
+                {
+                    ids.Add(node.Id);
+                }
+            }
+
+            var adjacency = ids.ToDictionary(id => id, _ => new List<string>(), StringComparer.Ordinal);
+            foreach (RevisionEdge edge in _edges)
+            {
+                adjacency[edge.Source.Id].Add(edge.Target.Id);
+            }
+
+            foreach (List<string> scc in FindStronglyConnectedComponents(ids, id => adjacency[id]))
+            {
+                var memberIds = new HashSet<string>(scc, StringComparer.Ordinal);
+                foreach (VersionNode node in _nodes.Where(n => memberIds.Contains(n.Id)))
+                {
+                    node.Contested = true;
+                }
+
+                List<string> paths = _edges
+                    .Where(e => memberIds.Contains(e.Source.Id) && memberIds.Contains(e.Target.Id))
+                    .Select(e => e.ReplacesPath)
+                    .ToList();
+                if (paths.Count > 0)
+                {
+                    string memberList = string.Join("→", scc.OrderBy(s => s, StringComparer.Ordinal));
+                    _emit(
+                        IssueCodes.ReferenceCycle,
+                        IssueSeverity.Error,
+                        $"补充协议替换构成有向环，涉及版本：{memberList}。",
+                        MinEvidencePath(paths));
+                }
+            }
+        }
+
+        /// <summary>未决污染：未决版本的后继一并未决。迭代式广度优先传播，不消耗调用栈。</summary>
+        private void PropagateContested()
+        {
+            var queue = new Queue<VersionNode>(_nodes.Where(n => n.Contested));
+            var seen = new HashSet<VersionNode>(queue);
+            while (queue.Count > 0)
+            {
+                VersionNode node = queue.Dequeue();
+                foreach (RevisionEdge edge in node.Out)
+                {
+                    if (seen.Add(edge.Target))
+                    {
+                        edge.Target.Contested = true;
+                        queue.Enqueue(edge.Target);
+                    }
+                }
+            }
+        }
+
+        private void ComputeStatuses()
+        {
+            foreach (VersionNode node in _nodes)
+            {
+                if (node.Contested)
+                {
+                    node.Status = VersionStatus.Contested;
+                    continue;
+                }
+
+                // 唯一后继且后继有效：本版本被替换；否则保持有效（无后继，或后继未决时保留原版）。
+                if (node.Out.Count == 1 && !node.Out[0].Target.Contested)
+                {
+                    node.Status = VersionStatus.Superseded;
+                }
+            }
+
+            // 生效修订边：源头无分叉、产物未决标记为空。
+            foreach (RevisionEdge edge in _edges)
+            {
+                edge.Applied = edge.Source.Out.Count == 1 && !edge.Target.Contested;
+            }
+        }
+
+        /// <summary>最短且稳定的证据路径：先比段数，再按路径比较器逐段比较。</summary>
+        internal static string MinEvidencePath(IEnumerable<string> paths)
+            => paths.OrderBy(EvidencePathComparer.SegmentCount)
+                .ThenBy(p => p, EvidencePathComparer.Instance)
+                .First();
+
+        /// <summary>迭代式 Tarjan 强连通分量算法：显式栈代替递归，任意深度的图都不会栈溢出。</summary>
+        internal static List<List<T>> FindStronglyConnectedComponents<T>(
+            IReadOnlyList<T> nodes,
+            Func<T, List<T>> children)
+            where T : notnull
+        {
+            var index = new Dictionary<T, int>();
+            var low = new Dictionary<T, int>();
+            var onStack = new HashSet<T>();
+            var stack = new List<T>();
+            var result = new List<List<T>>();
+            var inLargeScc = new HashSet<T>();
+            int counter = 0;
+
+            foreach (T start in nodes)
+            {
+                if (index.ContainsKey(start))
+                {
+                    continue;
+                }
+
+                var callStack = new Stack<(T Node, int NextChild)>();
+                index[start] = low[start] = counter++;
+                stack.Add(start);
+                onStack.Add(start);
+                callStack.Push((start, 0));
+
+                while (callStack.Count > 0)
+                {
+                    (T v, int next) = callStack.Pop();
+                    List<T> successors = children(v);
+                    if (next < successors.Count)
+                    {
+                        callStack.Push((v, next + 1));
+                        T w = successors[next];
+                        if (!index.ContainsKey(w))
+                        {
+                            index[w] = low[w] = counter++;
+                            stack.Add(w);
+                            onStack.Add(w);
+                            callStack.Push((w, 0));
+                        }
+                        else if (onStack.Contains(w))
+                        {
+                            low[v] = Math.Min(low[v], index[w]);
+                        }
+                    }
+                    else
+                    {
+                        if (low[v] == index[v])
+                        {
+                            var scc = new List<T>();
+                            T w;
+                            do
+                            {
+                                w = stack[^1];
+                                stack.RemoveAt(stack.Count - 1);
+                                onStack.Remove(w);
+                                scc.Add(w);
+                            }
+                            while (!EqualityComparer<T>.Default.Equals(w, v));
+
+                            if (scc.Count > 1)
+                            {
+                                result.Add(scc);
+                                foreach (T m in scc)
+                                {
+                                    inLargeScc.Add(m);
+                                }
+                            }
+                        }
+
+                        if (callStack.Count > 0)
+                        {
+                            T parent = callStack.Peek().Node;
+                            low[parent] = Math.Min(low[parent], low[v]);
+                        }
+                    }
+                }
+            }
+
+            // 自环：节点指向自身且不属于更大的环。
+            foreach (T node in nodes)
+            {
+                if (!inLargeScc.Contains(node) && children(node).Contains(node))
+                {
+                    result.Add(new List<T> { node });
+                }
+            }
+
+            return result;
+        }
+    }
+
+    /// <summary>构建完成的版本链内部视图：供一致性检查与公开投影使用。</summary>
+    private sealed class BuiltChain
+    {
+        private readonly Agreement _agreement;
+
+        public BuiltChain(Agreement agreement, List<VersionNode> nodes, Dictionary<string, VersionNode> canonical, List<RevisionEdge> edges)
+        {
+            _agreement = agreement;
+            Nodes = nodes;
+            Canonical = canonical;
+            Edges = edges;
+            Effective = Nodes.Where(n => n.Status == VersionStatus.Effective).OrderBy(n => n.Order).ToList();
+        }
+
+        public List<VersionNode> Nodes { get; }
+
+        public Dictionary<string, VersionNode> Canonical { get; }
+
+        public List<RevisionEdge> Edges { get; }
+
+        public List<VersionNode> Effective { get; }
+
+        /// <summary>实际生效（已被应用）的补充协议编号集合。</summary>
+        public IEnumerable<string> AppliedAmendmentIds => _agreement.Amendments
+            .Where(a => !a.Withdrawn)
+            .Select(a => a.Id)
+            .Where(id => Edges.Any(e => e.AmendmentId == id && e.Applied)
+                || Nodes.Any(n => n.ProducedBy == id && n.IsAppend && n.Status != VersionStatus.Contested));
+
+        /// <summary>沿父链解析义务人（取值与其原始 JSON 出处）。迭代实现，环安全。</summary>
+        public (string? Value, string? Path) ResolveObligor(VersionNode node)
+        {
+            var visited = new HashSet<VersionNode>();
+            VersionNode? current = node;
+            while (current is not null && visited.Add(current))
+            {
+                if (current.OwnObligorPath is not null || current.Parent is null)
+                {
+                    return (current.OwnObligorId, current.OwnObligorPath);
+                }
+
+                current = current.Parent;
+            }
+
+            return (null, null);
+        }
+
+        /// <summary>沿父链解析金额。迭代实现，环安全。</summary>
+        public long? ResolveAmount(VersionNode node)
+        {
+            var visited = new HashSet<VersionNode>();
+            VersionNode? current = node;
+            while (current is not null && visited.Add(current))
+            {
+                if (current.OwnAmountFen is not null || current.Parent is null)
+                {
+                    return current.OwnAmountFen;
+                }
+
+                current = current.Parent;
+            }
+
+            return null;
+        }
+
+        /// <summary>沿父链解析履行日期（取值与其原始 JSON 出处）。迭代实现，环安全。</summary>
+        public (DateOnly? Value, string? Path) ResolveDue(VersionNode node)
+        {
+            var visited = new HashSet<VersionNode>();
+            VersionNode? current = node;
+            while (current is not null && visited.Add(current))
+            {
+                if (current.OwnDuePath is not null || current.Parent is null)
+                {
+                    return (current.OwnDue, current.OwnDuePath);
+                }
+
+                current = current.Parent;
+            }
+
+            return (null, null);
+        }
+
+        /// <summary>沿父链解析引用列表（替换产物继承被替换版本的引用）。</summary>
+        public List<RefEdge> ResolveRefs(VersionNode node)
+        {
+            var visited = new HashSet<VersionNode>();
+            VersionNode? current = node;
+            while (current is not null && visited.Add(current))
+            {
+                if (current.OwnRefs is not null)
+                {
+                    return current.OwnRefs;
+                }
+
+                current = current.Parent;
+            }
+
+            return new List<RefEdge>();
+        }
+
+        /// <summary>
+        /// 把引用目标编号解析到版本链头：从该编号的规范版本出发，沿唯一生效后继迭代前进。
+        /// 返回 null 表示编号不存在（悬空）；返回未决节点表示目标处于分叉/环中。
+        /// </summary>
+        public VersionNode? ResolveHead(string rawId)
+        {
+            if (!Canonical.TryGetValue(rawId, out VersionNode? node))
+            {
+                return null;
+            }
+
+            var visited = new HashSet<VersionNode>();
+            while (visited.Add(node)
+                && node.Status != VersionStatus.Contested
+                && node.Out.Count == 1
+                && !node.Out[0].Target.Contested)
+            {
+                node = node.Out[0].Target;
+            }
+
+            return node;
+        }
+
+        /// <summary>投影为公开的可审计版本链。</summary>
+        public VersionChain ToPublicChain()
+        {
+            ClauseVersion Project(VersionNode n) => new()
+            {
+                Id = n.Id,
+                OriginPath = n.OriginPath,
+                Status = n.Status,
+                ObligorId = ResolveObligor(n).Value,
+                AmountFen = ResolveAmount(n),
+                Due = ResolveDue(n).Value,
+                References = ResolveRefs(n).Select(r => r.RawTarget).ToList(),
+            };
+
+            return new VersionChain
+            {
+                Versions = Nodes.OrderBy(n => n.Order).Select(Project).ToList(),
+                Revisions = Edges.OrderBy(e => e.AmendmentIndex).Select(e => new RevisionLink
+                {
+                    AmendmentId = e.AmendmentId,
+                    FromId = e.Source.Id,
+                    ToId = e.Target.Id,
+                    EvidencePath = e.ReplacesPath,
+                    Applied = e.Applied,
+                }).ToList(),
+                EffectiveVersions = Effective.Select(Project).ToList(),
+            };
+        }
+    }
+
     private sealed class Engine
     {
         private readonly Agreement _agreement;
         private readonly List<AuditIssue> _issues = new();
         private readonly HashSet<string> _seen = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, EffectiveClause> _effectiveById = new(StringComparer.Ordinal);
-        private readonly List<EffectiveClause> _effectiveInOrder = new();
-        private readonly Dictionary<string, string> _replacedBy = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, string> _chainNext = new(StringComparer.Ordinal);
-        private readonly List<string> _effectiveAmendmentIds = new();
+        private BuiltChain _chain = null!;
 
         public Engine(Agreement agreement) => _agreement = agreement;
 
         public AuditResult Run()
         {
-            LoadBaseClauses();
-            ApplyAmendments();
-            Dictionary<string, string> chainFinal = BuildChainFinalMap();
-            CheckReferences(chainFinal);
-            CheckDateOrder(chainFinal);
+            _chain = new ChainBuilder(_agreement, Emit).Build();
+            CheckReferences();
+            CheckDateOrder();
             CheckAmounts();
             CheckSignatures();
-            CheckCycles(chainFinal);
+            CheckReferenceCycles();
 
             List<AuditIssue> sorted = _issues
                 .OrderBy(i => i.Code, StringComparer.Ordinal)
@@ -558,190 +1346,93 @@ public static class AgreementAuditor
                 .ThenBy(i => i.Message, StringComparer.Ordinal)
                 .ToList();
 
-            return new AuditResult { AgreementId = _agreement.Id, Issues = sorted };
+            return new AuditResult
+            {
+                AgreementId = _agreement.Id,
+                Issues = sorted,
+                Versions = _chain.ToPublicChain(),
+            };
         }
 
         private void Emit(string code, IssueSeverity severity, string message, string evidencePath)
         {
             // 同一问题（代码+路径+文案）只报告一次：重复提交的相同内容不会放大结果。
-            if (_seen.Add(string.Concat(code, "", evidencePath, "", message)))
+            if (_seen.Add(code + "|" + evidencePath + "|" + message))
             {
                 _issues.Add(new AuditIssue { Code = code, Severity = severity, Message = message, EvidencePath = evidencePath });
             }
         }
 
-        private void LoadBaseClauses()
+        private void CheckReferences()
         {
-            for (int i = 0; i < _agreement.Clauses.Count; i++)
+            foreach (VersionNode node in _chain.Effective)
             {
-                Clause c = _agreement.Clauses[i];
-                if (_effectiveById.ContainsKey(c.Id))
-                {
-                    continue; // 编号重复时以先出现者为准，行为确定。
-                }
-
-                var ec = new EffectiveClause
-                {
-                    Id = c.Id,
-                    ObligorId = c.Obligation.ObligorId,
-                    ObligorPath = c.Obligation.ObligorId is null ? null : $"$.clauses[{i}].obligor",
-                    AmountFen = c.Obligation.AmountFen,
-                    Due = c.Obligation.Due,
-                    DuePath = c.Obligation.Due is null ? null : $"$.clauses[{i}].due",
-                    Order = i,
-                };
-                for (int j = 0; j < c.References.Count; j++)
-                {
-                    ec.Refs.Add(new RefEdge(c.References[j], $"$.clauses[{i}].references[{j}]"));
-                }
-
-                _effectiveById.Add(c.Id, ec);
-                _effectiveInOrder.Add(ec);
-            }
-        }
-
-        private void ApplyAmendments()
-        {
-            for (int i = 0; i < _agreement.Amendments.Count; i++)
-            {
-                Amendment a = _agreement.Amendments[i];
-                if (a.Withdrawn)
-                {
-                    continue; // 已撤回：无效果、不要求签署；其产物视为不存在。
-                }
-
-                string replacesPath = $"$.amendments[{i}].replaces";
-                if (_replacedBy.ContainsKey(a.Replaces))
-                {
-                    Emit(
-                        IssueCodes.AmendmentConflict,
-                        IssueSeverity.Error,
-                        $"条款 '{a.Replaces}' 已被补充协议 '{_replacedBy[a.Replaces]}' 替换，'{a.Id}' 构成重复替换。",
-                        replacesPath);
-                    continue;
-                }
-
-                if (!_effectiveById.TryGetValue(a.Replaces, out EffectiveClause? target))
-                {
-                    Emit(
-                        IssueCodes.AmendmentTargetUnknown,
-                        IssueSeverity.Error,
-                        $"补充协议 '{a.Id}' 要替换的条款 '{a.Replaces}' 不存在（或产生它的补充协议已撤回）。",
-                        replacesPath);
-                    continue;
-                }
-
-                string newId = string.IsNullOrEmpty(a.NewClauseId) ? a.Replaces : a.NewClauseId!;
-                var replacement = new EffectiveClause
-                {
-                    Id = newId,
-                    ObligorId = target.ObligorId,
-                    ObligorPath = target.ObligorPath,
-                    AmountFen = a.AmountFen ?? target.AmountFen,
-                    Due = a.Due ?? target.Due,
-                    DuePath = a.Due is not null ? $"$.amendments[{i}].due" : target.DuePath,
-                    Order = _agreement.Clauses.Count + i,
-                };
-                replacement.Refs.AddRange(target.Refs);
-
-                _effectiveById.Remove(a.Replaces);
-                _effectiveById[newId] = replacement;
-                _effectiveInOrder.Remove(target);
-                _effectiveInOrder.Add(replacement);
-                _replacedBy[a.Replaces] = a.Id;
-                _chainNext[a.Replaces] = newId;
-                _effectiveAmendmentIds.Add(a.Id);
-            }
-        }
-
-        /// <summary>把每个被替换编号沿替换链迭代追踪到最终生效编号；visited 集合防止异常链条造成死循环。</summary>
-        private Dictionary<string, string> BuildChainFinalMap()
-        {
-            var map = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (string replaced in _chainNext.Keys.OrderBy(k => k, StringComparer.Ordinal))
-            {
-                string current = replaced;
-                var visited = new HashSet<string>(StringComparer.Ordinal) { current };
-                while (_chainNext.TryGetValue(current, out string? next) && visited.Add(next))
-                {
-                    current = next;
-                }
-
-                map[replaced] = current;
-            }
-
-            return map;
-        }
-
-        private void CheckReferences(Dictionary<string, string> chainFinal)
-        {
-            foreach (EffectiveClause clause in _effectiveInOrder.OrderBy(c => c.Order))
-            {
-                // 义务人必须是已知当事人。
-                if (clause.ObligorId is not null
-                    && !_agreement.Parties.Any(p => p.Id == clause.ObligorId)
-                    && clause.ObligorPath is not null)
+                (string? obligor, string? obligorPath) = _chain.ResolveObligor(node);
+                if (obligor is not null
+                    && obligorPath is not null
+                    && !_agreement.Parties.Any(p => p.Id == obligor))
                 {
                     Emit(
                         IssueCodes.UnknownReference,
                         IssueSeverity.Error,
-                        $"条款 '{clause.Id}' 的义务人 '{clause.ObligorId}' 不在当事人列表中。",
-                        clause.ObligorPath);
+                        $"条款 '{node.Id}' 的义务人 '{obligor}' 不在当事人列表中。",
+                        obligorPath);
                 }
 
-                foreach (RefEdge edge in clause.Refs)
+                foreach (RefEdge edge in _chain.ResolveRefs(node))
                 {
-                    if (_effectiveById.ContainsKey(edge.RawTarget))
-                    {
-                        continue;
-                    }
-
-                    if (chainFinal.TryGetValue(edge.RawTarget, out string? final) && _effectiveById.ContainsKey(final))
-                    {
-                        Emit(
-                            IssueCodes.StaleReference,
-                            IssueSeverity.Warning,
-                            $"引用仍指向已被补充协议 '{_replacedBy[edge.RawTarget]}' 替换的条款 '{edge.RawTarget}'，应改指向 '{final}'。",
-                            edge.Path);
-                    }
-                    else
+                    VersionNode? head = _chain.ResolveHead(edge.RawTarget);
+                    if (head is null)
                     {
                         Emit(
                             IssueCodes.UnknownReference,
                             IssueSeverity.Error,
-                            $"条款 '{clause.Id}' 引用了不存在的条款 '{edge.RawTarget}'。",
+                            $"条款 '{node.Id}' 引用了不存在的条款 '{edge.RawTarget}'。",
                             edge.Path);
                     }
+                    else if (head.Status == VersionStatus.Effective && head.Id != edge.RawTarget)
+                    {
+                        string via = _chain.Canonical[edge.RawTarget].Out.Count > 0
+                            ? _chain.Canonical[edge.RawTarget].Out[0].AmendmentId
+                            : string.Empty;
+                        Emit(
+                            IssueCodes.StaleReference,
+                            IssueSeverity.Warning,
+                            $"引用仍指向已被补充协议 '{via}' 替换的条款 '{edge.RawTarget}'，应改指向 '{head.Id}'。",
+                            edge.Path);
+                    }
+
+                    // 目标未决：分叉/替换环已各自报告，此处不重复。
                 }
             }
         }
 
-        private void CheckDateOrder(Dictionary<string, string> chainFinal)
+        private void CheckDateOrder()
         {
-            foreach (EffectiveClause clause in _effectiveInOrder.OrderBy(c => c.Order))
+            foreach (VersionNode node in _chain.Effective)
             {
-                if (clause.Due is null || clause.DuePath is null)
+                (DateOnly? due, string? duePath) = _chain.ResolveDue(node);
+                if (due is null || duePath is null)
                 {
                     continue;
                 }
 
-                foreach (RefEdge edge in clause.Refs)
+                foreach (RefEdge edge in _chain.ResolveRefs(node))
                 {
-                    string targetId = _effectiveById.ContainsKey(edge.RawTarget)
-                        ? edge.RawTarget
-                        : chainFinal.TryGetValue(edge.RawTarget, out string? f) ? f : edge.RawTarget;
-                    if (!_effectiveById.TryGetValue(targetId, out EffectiveClause? target) || target.Due is null)
+                    VersionNode? head = _chain.ResolveHead(edge.RawTarget);
+                    if (head is null || head.Status != VersionStatus.Effective)
                     {
                         continue;
                     }
 
-                    if (clause.Due.Value < target.Due.Value)
+                    (DateOnly? targetDue, _) = _chain.ResolveDue(head);
+                    if (targetDue is not null && due.Value < targetDue.Value)
                     {
                         Emit(
                             IssueCodes.DateOrder,
                             IssueSeverity.Error,
-                            $"条款 '{clause.Id}' 的履行日期 {clause.Due.Value:yyyy-MM-dd} 早于其依赖条款 '{targetId}' 的履行日期 {target.Due.Value:yyyy-MM-dd}。",
-                            clause.DuePath);
+                            $"条款 '{node.Id}' 的履行日期 {due.Value:yyyy-MM-dd} 早于其依赖条款 '{head.Id}' 的履行日期 {targetDue.Value:yyyy-MM-dd}。",
+                            duePath);
                     }
                 }
             }
@@ -755,9 +1446,9 @@ public static class AgreementAuditor
             }
 
             long sum = 0;
-            foreach (EffectiveClause clause in _effectiveInOrder)
+            foreach (VersionNode node in _chain.Effective)
             {
-                sum += clause.AmountFen ?? 0;
+                sum += _chain.ResolveAmount(node) ?? 0;
             }
 
             if (sum != _agreement.TotalAmountFen.Value)
@@ -774,9 +1465,9 @@ public static class AgreementAuditor
         {
             var partyIds = new HashSet<string>(_agreement.Parties.Select(p => p.Id), StringComparer.Ordinal);
 
-            // 有效签署范围：协议本体 + 已生效补充协议。
+            // 有效签署范围：协议本体 + 已生效（已应用且未未决）补充协议。
             var validScope = new HashSet<string>(StringComparer.Ordinal) { _agreement.Id };
-            foreach (string id in _effectiveAmendmentIds)
+            foreach (string id in _chain.AppliedAmendmentIds)
             {
                 validScope.Add(id);
             }
@@ -800,7 +1491,7 @@ public static class AgreementAuditor
                         Emit(
                             IssueCodes.SignatureScopeUnknown,
                             IssueSeverity.Error,
-                            $"签署范围条目 '{sig.Scope[j]}' 不是当前有效的协议或补充协议编号（可能为未知编号或已撤回/未生效）。",
+                            $"签署范围条目 '{sig.Scope[j]}' 不是当前有效的协议或补充协议编号（可能为未知编号、已撤回或未生效）。",
                             $"$.signatures[{i}].scope[{j}]");
                     }
                 }
@@ -843,150 +1534,42 @@ public static class AgreementAuditor
             }
         }
 
-        private void CheckCycles(Dictionary<string, string> chainFinal)
+        /// <summary>条款引用环：在生效条款视图上检测有向环，证据取环内引用边中最短且最小的一条。</summary>
+        private void CheckReferenceCycles()
         {
-            // 邻接表：边 = 引用（解析到生效条款），按文档顺序，携带原始 JSON 路径。
-            var adjacency = new Dictionary<string, List<(string Target, string Path)>>(StringComparer.Ordinal);
-            List<EffectiveClause> nodes = _effectiveInOrder.OrderBy(c => c.Order).ToList();
-            foreach (EffectiveClause clause in nodes)
+            var edges = new Dictionary<VersionNode, List<(VersionNode Target, string Path)>>();
+            foreach (VersionNode node in _chain.Effective)
             {
-                var edges = new List<(string, string)>();
-                foreach (RefEdge edge in clause.Refs)
+                var list = new List<(VersionNode, string)>();
+                foreach (RefEdge edge in _chain.ResolveRefs(node))
                 {
-                    string targetId = _effectiveById.ContainsKey(edge.RawTarget)
-                        ? edge.RawTarget
-                        : chainFinal.TryGetValue(edge.RawTarget, out string? f) ? f : edge.RawTarget;
-                    if (_effectiveById.ContainsKey(targetId))
+                    VersionNode? head = _chain.ResolveHead(edge.RawTarget);
+                    if (head is not null && head.Status == VersionStatus.Effective)
                     {
-                        edges.Add((targetId, edge.Path));
+                        list.Add((head, edge.Path));
                     }
                 }
 
-                adjacency[clause.Id] = edges;
+                edges[node] = list;
             }
 
-            foreach (List<string> scc in FindStronglyConnectedComponents(nodes.Select(n => n.Id), adjacency))
+            foreach (List<VersionNode> scc in ChainBuilder.FindStronglyConnectedComponents(_chain.Effective, n => edges[n].Select(e => e.Target).ToList()))
             {
-                var members = new HashSet<string>(scc, StringComparer.Ordinal);
-                string? bestPath = null;
-                foreach (EffectiveClause clause in nodes)
+                var members = new HashSet<VersionNode>(scc);
+                List<string> paths = _chain.Effective
+                    .Where(members.Contains)
+                    .SelectMany(n => edges[n].Where(e => members.Contains(e.Target)).Select(e => e.Path))
+                    .ToList();
+                if (paths.Count > 0)
                 {
-                    if (!members.Contains(clause.Id))
-                    {
-                        continue;
-                    }
-
-                    foreach ((string target, string path) in adjacency[clause.Id])
-                    {
-                        if (members.Contains(target) && (bestPath is null || EvidencePathComparer.Instance.Compare(path, bestPath) < 0))
-                        {
-                            bestPath = path;
-                        }
-                    }
-                }
-
-                if (bestPath is not null)
-                {
-                    string memberList = string.Join("、", nodes.Where(n => members.Contains(n.Id)).Select(n => n.Id));
+                    string memberList = string.Join("、", _chain.Effective.Where(members.Contains).Select(n => n.Id));
                     Emit(
                         IssueCodes.ReferenceCycle,
                         IssueSeverity.Error,
                         $"条款引用构成有向环，涉及：{memberList}。",
-                        bestPath);
+                        ChainBuilder.MinEvidencePath(paths));
                 }
             }
-        }
-
-        /// <summary>迭代式 Tarjan 强连通分量算法：显式栈代替递归，任意深度的图都不会栈溢出。</summary>
-        private static List<List<string>> FindStronglyConnectedComponents(
-            IEnumerable<string> nodeIds,
-            Dictionary<string, List<(string Target, string Path)>> adjacency)
-        {
-            var index = new Dictionary<string, int>(StringComparer.Ordinal);
-            var low = new Dictionary<string, int>(StringComparer.Ordinal);
-            var onStack = new HashSet<string>(StringComparer.Ordinal);
-            var stack = new List<string>();
-            var result = new List<List<string>>();
-            var inLargeScc = new HashSet<string>(StringComparer.Ordinal);
-            int counter = 0;
-
-            foreach (string start in nodeIds)
-            {
-                if (index.ContainsKey(start))
-                {
-                    continue;
-                }
-
-                var callStack = new Stack<(string Node, int NextChild)>();
-                index[start] = low[start] = counter++;
-                stack.Add(start);
-                onStack.Add(start);
-                callStack.Push((start, 0));
-
-                while (callStack.Count > 0)
-                {
-                    (string v, int next) = callStack.Pop();
-                    List<(string Target, string Path)> children = adjacency[v];
-                    if (next < children.Count)
-                    {
-                        callStack.Push((v, next + 1));
-                        string w = children[next].Target;
-                        if (!index.ContainsKey(w))
-                        {
-                            index[w] = low[w] = counter++;
-                            stack.Add(w);
-                            onStack.Add(w);
-                            callStack.Push((w, 0));
-                        }
-                        else if (onStack.Contains(w))
-                        {
-                            low[v] = Math.Min(low[v], index[w]);
-                        }
-                    }
-                    else
-                    {
-                        if (low[v] == index[v])
-                        {
-                            var scc = new List<string>();
-                            string w;
-                            do
-                            {
-                                w = stack[^1];
-                                stack.RemoveAt(stack.Count - 1);
-                                onStack.Remove(w);
-                                scc.Add(w);
-                            }
-                            while (w != v);
-
-                            if (scc.Count > 1)
-                            {
-                                result.Add(scc);
-                                foreach (string m in scc)
-                                {
-                                    inLargeScc.Add(m);
-                                }
-                            }
-                        }
-
-                        if (callStack.Count > 0)
-                        {
-                            string parent = callStack.Peek().Node;
-                            low[parent] = Math.Min(low[parent], low[v]);
-                        }
-                    }
-                }
-            }
-
-            // 自环：节点引用自身且不属于更大的环。
-            foreach (KeyValuePair<string, List<(string Target, string Path)>> pair in adjacency)
-            {
-                if (!inLargeScc.Contains(pair.Key) && pair.Value.Any(e => e.Target == pair.Key))
-                {
-                    result.Add(new List<string> { pair.Key });
-                }
-            }
-
-            return result;
         }
     }
 
@@ -997,6 +1580,8 @@ public static class AgreementAuditor
     private sealed class EvidencePathComparer : IComparer<string>
     {
         public static readonly EvidencePathComparer Instance = new();
+
+        public static int SegmentCount(string path) => Tokenize(path).Count;
 
         public int Compare(string? x, string? y)
         {

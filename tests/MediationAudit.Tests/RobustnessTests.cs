@@ -209,7 +209,45 @@ public class RobustnessTests
         }
     }
 
-    private static string BuildRandomAgreementJson(int seed)
+    [Fact]
+    public void AmendmentOrderPermutation_PreservesViewCodesAndEvidence()
+    {
+        // 对每份随机协议包，把补充协议数组逆序后重新审计：
+        // 有效条款视图、冲突问题码与说明必须逐项一致；证据路径归一化数组下标后一致。
+        for (int seed = 100; seed < 118; seed++)
+        {
+            string original = BuildRandomAgreementJson(seed);
+            int amendmentCount = CountAmendments(original);
+            int[] reversed = Enumerable.Range(0, amendmentCount).Reverse().ToArray();
+            string swapped = BuildRandomAgreementJson(seed, reversed);
+
+            AuditResult a = AgreementAuditor.Audit(original);
+            AuditResult b = AgreementAuditor.Audit(swapped);
+
+            Assert.Equal(
+                a.Issues.Select(IssueKey).OrderBy(k => k, StringComparer.Ordinal).ToArray(),
+                b.Issues.Select(IssueKey).OrderBy(k => k, StringComparer.Ordinal).ToArray());
+            Assert.Equal(
+                a.Versions.EffectiveVersions.Select(ViewKey).OrderBy(k => k, StringComparer.Ordinal).ToArray(),
+                b.Versions.EffectiveVersions.Select(ViewKey).OrderBy(k => k, StringComparer.Ordinal).ToArray());
+        }
+
+        static string IssueKey(AuditIssue i) => $"{i.Code}|{NormalizePath(i.EvidencePath)}|{i.Message}";
+
+        static string ViewKey(ClauseVersion v)
+            => $"{v.Id}|{v.ObligorId}|{v.AmountFen}|{v.Due}|{string.Join(",", v.References)}";
+    }
+
+    private static string NormalizePath(string path)
+        => System.Text.RegularExpressions.Regex.Replace(path, @"amendments\[\d+\]", "amendments[#]");
+
+    private static int CountAmendments(string json)
+    {
+        using JsonDocument doc = JsonDocument.Parse(json);
+        return doc.RootElement.TryGetProperty("amendments", out JsonElement arr) ? arr.GetArrayLength() : 0;
+    }
+
+    private static string BuildRandomAgreementJson(int seed, int[]? amendmentOrder = null)
     {
         var random = new Random(seed);
         int clauseCount = random.Next(2, 40);
@@ -271,43 +309,81 @@ public class RobustnessTests
             sb.Append('}');
         }
 
-        sb.Append("],\"amendments\":[");
+        // 先构建全部补充协议片段，再按给定顺序输出（用于交换数组顺序的等价性验证）。
+        var amendmentFragments = new List<string>();
         var producedIds = new List<string>();
         for (int i = 0; i < amendmentCount; i++)
         {
-            if (i > 0)
+            var frag = new StringBuilder();
+            if (random.Next(4) == 0)
+            {
+                // 追加形态：编号唯一；引用 1/4 概率悬空。
+                frag.Append("{\"id\":\"AM").Append(i).Append("\",\"appends\":{\"id\":\"AP").Append(i)
+                    .Append("\",\"obligor\":\"P").Append(random.Next(partyCount)).Append('"');
+                if (random.Next(2) == 0)
+                {
+                    frag.Append(",\"amountFen\":").Append(random.Next(1, 1000));
+                }
+
+                if (random.Next(2) == 0)
+                {
+                    frag.Append(",\"due\":\"2026-").Append(random.Next(1, 13).ToString("D2")).Append("-")
+                        .Append(random.Next(1, 29).ToString("D2")).Append('"');
+                }
+
+                if (random.Next(2) == 0)
+                {
+                    int target = random.Next(4) == 0 ? clauseCount + random.Next(3) : random.Next(clauseCount);
+                    frag.Append(",\"references\":[\"C").Append(target).Append("\"]");
+                }
+
+                frag.Append("}}");
+            }
+            else
+            {
+                // 替换形态：目标为基础条款、先前补充协议产物或落空编号，模拟替换链、分叉与落空。
+                string target = random.Next(4) switch
+                {
+                    0 when producedIds.Count > 0 => producedIds[random.Next(producedIds.Count)],
+                    1 => "C" + (clauseCount + random.Next(3)),
+                    _ => "C" + random.Next(clauseCount),
+                };
+                string newId = $"R{i}";
+                producedIds.Add(newId);
+                frag.Append("{\"id\":\"AM").Append(i).Append("\",\"replaces\":\"").Append(target)
+                    .Append("\",\"newClauseId\":\"").Append(newId).Append('"');
+                if (random.Next(3) == 0)
+                {
+                    frag.Append(",\"amountFen\":").Append(random.Next(1, 1000));
+                }
+
+                if (random.Next(3) == 0)
+                {
+                    frag.Append(",\"due\":\"2026-").Append(random.Next(1, 13).ToString("D2")).Append("-")
+                        .Append(random.Next(1, 29).ToString("D2")).Append('"');
+                }
+
+                if (random.Next(5) == 0)
+                {
+                    frag.Append(",\"withdrawn\":true");
+                }
+
+                frag.Append('}');
+            }
+
+            amendmentFragments.Add(frag.ToString());
+        }
+
+        sb.Append("],\"amendments\":[");
+        int[] order = amendmentOrder ?? Enumerable.Range(0, amendmentCount).ToArray();
+        for (int k = 0; k < order.Length; k++)
+        {
+            if (k > 0)
             {
                 sb.Append(',');
             }
 
-            // 目标：基础条款、先前补充协议产物或落空编号，分别模拟替换链与落空/冲突。
-            string target = random.Next(4) switch
-            {
-                0 when producedIds.Count > 0 => producedIds[random.Next(producedIds.Count)],
-                1 => "C" + (clauseCount + random.Next(3)),
-                _ => "C" + random.Next(clauseCount),
-            };
-            string newId = $"R{i}";
-            producedIds.Add(newId);
-            sb.Append("{\"id\":\"AM").Append(i).Append("\",\"replaces\":\"").Append(target)
-                .Append("\",\"newClauseId\":\"").Append(newId).Append('"');
-            if (random.Next(3) == 0)
-            {
-                sb.Append(",\"amountFen\":").Append(random.Next(1, 1000));
-            }
-
-            if (random.Next(3) == 0)
-            {
-                sb.Append(",\"due\":\"2026-").Append(random.Next(1, 13).ToString("D2")).Append("-")
-                    .Append(random.Next(1, 29).ToString("D2")).Append('"');
-            }
-
-            if (random.Next(5) == 0)
-            {
-                sb.Append(",\"withdrawn\":true");
-            }
-
-            sb.Append('}');
+            sb.Append(amendmentFragments[order[k]]);
         }
 
         sb.Append("],\"signatures\":[");

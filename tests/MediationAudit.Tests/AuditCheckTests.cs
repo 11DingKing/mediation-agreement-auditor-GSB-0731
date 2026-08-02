@@ -67,10 +67,10 @@ public class AuditCheckTests
     }
 
     [Fact]
-    public void AmendmentChain_AppliesSequentiallyAndFlagsConflict()
+    public void AmendmentChain_ForkKeepsSourceEffectiveAndFlagsConflict()
     {
-        // 多次条款替换夹具：C1 -> C1-R1 -> C1-R2 依次生效，A3 再次替换 C1 构成重复替换冲突。
-        // 金额总额 300 与最终生效金额一致，验证替换链只保留最新值。
+        // 多次替换 + 并发替换夹具：A1/A2 构成链 C1 -> C1-R1 -> C1-R2，A3 与 A1 并发替换 C1。
+        // 分叉语义与数组顺序无关：分叉源 C1 保持有效，全部分支未决；总额按有效视图核对（100 ≠ 300）。
         const string json = """
         {
           "agreementId": "AGR-T-CHAIN",
@@ -82,8 +82,8 @@ public class AuditCheckTests
             {"id": "A3", "replaces": "C1", "newClauseId": "C1-X", "amountFen": 999}
           ],
           "signatures": [
-            {"partyId": "P1", "scope": ["AGR-T-CHAIN", "A1", "A2"]},
-            {"partyId": "P2", "scope": ["AGR-T-CHAIN", "A1", "A2"]}
+            {"partyId": "P1", "scope": ["AGR-T-CHAIN"]},
+            {"partyId": "P2", "scope": ["AGR-T-CHAIN"]}
           ],
           "totalAmountFen": 300
         }
@@ -91,9 +91,25 @@ public class AuditCheckTests
 
         AuditResult result = AgreementAuditor.Audit(json);
 
-        AuditIssue issue = Assert.Single(result.Issues);
-        Assert.Equal(IssueCodes.AmendmentConflict, issue.Code);
-        Assert.Equal("$.amendments[2].replaces", issue.EvidencePath);
+        Assert.Equal(
+            new[]
+            {
+                (IssueCodes.AmendmentConflict, "$.amendments[0].replaces"),
+                (IssueCodes.AmountMismatch, "$.totalAmountFen"),
+            },
+            result.Issues.Select(i => (i.Code, i.EvidencePath)).ToArray());
+
+        // 有向版本链：全部旧版本保留，分叉源保持有效，分支一并未决。
+        Assert.Equal(
+            new[]
+            {
+                ("C1", VersionStatus.Effective),
+                ("C1-R1", VersionStatus.Contested),
+                ("C1-R2", VersionStatus.Contested),
+                ("C1-X", VersionStatus.Contested),
+            },
+            result.Versions.Versions.Select(v => (v.Id, v.Status)).ToArray());
+        Assert.Equal("C1", Assert.Single(result.Versions.EffectiveVersions).Id);
     }
 
     [Fact]
