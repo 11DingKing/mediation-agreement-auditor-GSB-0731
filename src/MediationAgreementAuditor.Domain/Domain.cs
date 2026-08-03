@@ -167,8 +167,91 @@ public sealed class AuditResult
     public IReadOnlyDictionary<string, Obligation> EffectiveObligations { get; init; } =
         new Dictionary<string, Obligation>();
 
+    /// <summary>
+    /// Auditable directed version chains, one per original clause. Each chain lists every
+    /// replacement link from the original clause through its active amendments. Old versions
+    /// are never physically deleted; they remain reachable through the links.
+    /// </summary>
+    public IReadOnlyList<ClauseVersionChain> VersionChains { get; init; } =
+        Array.Empty<ClauseVersionChain>();
+
     /// <summary><see langword="true"/> when at least one error-severity issue exists.</summary>
     public bool HasErrors { get; init; }
+}
+
+/// <summary>
+/// A single directed edge in a clause's version chain. The edge goes from the version
+/// identified by <see cref="FromVersionId"/> (the <c>replaces</c> target) to
+/// <see cref="ToVersionId"/> (the <c>newClauseId</c>) and carries the amendment's overrides.
+/// </summary>
+public sealed class VersionLink
+{
+    /// <summary>Identifier of the amendment that created this link.</summary>
+    public string AmendmentId { get; init; } = string.Empty;
+
+    /// <summary>Source version identifier (the value of <c>replaces</c>).</summary>
+    public string FromVersionId { get; init; } = string.Empty;
+
+    /// <summary>Target version identifier (the value of <c>newClauseId</c>).</summary>
+    public string ToVersionId { get; init; } = string.Empty;
+
+    /// <summary>Amount override in fen, or <see langword="null"/> to inherit the source amount.</summary>
+    public long? AmountFen { get; init; }
+
+    /// <summary>Due-date override, or <see langword="null"/> to inherit the source due date.</summary>
+    public DateOnly? Due { get; init; }
+
+    /// <summary>JSON evidence path for the <c>replaces</c> field that anchors this link.</summary>
+    public string ReplacesEvidencePath { get; init; } = string.Empty;
+
+    /// <summary>JSON evidence path for the <c>newClauseId</c> field introduced by this link.</summary>
+    public string NewClauseIdEvidencePath { get; init; } = string.Empty;
+}
+
+/// <summary>
+/// The auditable directed version chain rooted at one original clause. The chain lists every
+/// active replacement link in deterministic order. When the chain is linear (one successor per
+/// version), <see cref="EffectiveVersionId"/> identifies the version currently in force; when a
+/// fork or cycle is present the chain is conflicted and no single effective version is resolved.
+/// </summary>
+public sealed class ClauseVersionChain
+{
+    /// <summary>Identifier of the original clause at the root of this chain.</summary>
+    public string RootClauseId { get; init; } = string.Empty;
+
+    /// <summary>JSON evidence path of the original clause (its <c>id</c> field).</summary>
+    public string RootEvidencePath { get; init; } = string.Empty;
+
+    /// <summary>
+    /// All directed links reachable from the root, sorted by amendment identifier. The list
+    /// preserves every old version; nothing is physically deleted.
+    /// </summary>
+    public IReadOnlyList<VersionLink> Links { get; init; } = Array.Empty<VersionLink>();
+
+    /// <summary>
+    /// Identifier of the version currently in force (the leaf of a linear chain), or
+    /// <see langword="null"/> when the chain is forked or cyclic.
+    /// </summary>
+    public string? EffectiveVersionId { get; init; }
+
+    /// <summary><see langword="true"/> when two or more amendments replace the same version (a fork).</summary>
+    public bool HasFork { get; init; }
+
+    /// <summary><see langword="true"/> when the replacement graph contains a directed cycle.</summary>
+    public bool HasCycle { get; init; }
+
+    /// <summary>
+    /// Candidate leaf version identifiers when <see cref="HasFork"/> is <see langword="true"/>;
+    /// empty otherwise.
+    /// </summary>
+    public IReadOnlyList<string> CandidateVersionIds { get; init; } = Array.Empty<string>();
+
+    /// <summary>
+    /// Shortest stable JSON evidence path for the conflict (the <c>replaces</c> field of the
+    /// deterministically-first competing or back-edge amendment), or <see langword="null"/> when
+    /// the chain is not conflicted.
+    /// </summary>
+    public string? ConflictEvidencePath { get; init; }
 }
 
 /// <summary>
@@ -395,109 +478,66 @@ public static class AgreementAuditor
             active[i] = hasReplacement[i] && !withdrawn[i];
         }
 
-        var newIdOwner = new Dictionary<string, int>(StringComparer.Ordinal);
-        var targetSuccessors = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-        var activeNewIds = new HashSet<string>(StringComparer.Ordinal);
+        var graph = BuildVersionGraph(p, active, clauseIds, issues);
 
-        for (var i = 0; i < n; i++)
+        var versionValues = BuildAllVersionValues(p, graph, clauseIds, issues);
+
+        var chains = BuildVersionChains(p, graph, versionValues, issues);
+
+        var finalVersion = new Dictionary<string, string>(StringComparer.Ordinal);
+        var conflictedVersions = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var chain in chains)
         {
-            if (!active[i])
+            if (chain.HasFork || chain.HasCycle)
             {
-                continue;
-            }
-
-            var a = p.Amendments[i];
-            var newId = a.NewClauseId!;
-            activeNewIds.Add(newId);
-
-            if (clauseIds.Contains(newId) || !newIdOwner.TryAdd(newId, i))
-            {
-                issues.Add(new Issue(IssueCodes.AmendmentNewIdCollision, Severity.Error,
-                    $"Amendment '{a.Id}' newClauseId '{newId}' collides with an existing identifier.",
-                    $"$.amendments[{i}].newClauseId"));
-            }
-
-            var target = a.Replaces!;
-            if (!targetSuccessors.TryGetValue(target, out var list))
-            {
-                list = new List<int>();
-                targetSuccessors[target] = list;
-            }
-            list.Add(i);
-        }
-
-        for (var i = 0; i < n; i++)
-        {
-            if (!active[i])
-            {
-                continue;
-            }
-
-            var a = p.Amendments[i];
-            var target = a.Replaces!;
-            var targetIsOriginal = clauseIds.Contains(target);
-            var targetIsActiveVersion = activeNewIds.Contains(target);
-            if (!targetIsOriginal && !targetIsActiveVersion)
-            {
-                issues.Add(new Issue(IssueCodes.AmendmentTargetMissing, Severity.Error,
-                    $"Amendment '{a.Id}' replaces unknown clause or version '{target}'.",
-                    $"$.amendments[{i}].replaces"));
-            }
-
-            if (targetSuccessors.TryGetValue(target, out var succ) && succ.Count > 1)
-            {
-                // Reported once per competing amendment below to keep evidence precise.
-            }
-        }
-
-        foreach (var kvp in targetSuccessors)
-        {
-            if (kvp.Value.Count > 1)
-            {
-                foreach (var idx in kvp.Value)
+                conflictedVersions.Add(chain.RootClauseId);
+                foreach (var link in chain.Links)
                 {
-                    issues.Add(new Issue(IssueCodes.AmendmentAmbiguous, Severity.Error,
-                        $"Amendment '{p.Amendments[idx].Id}' is one of {kvp.Value.Count} active amendments replacing '{kvp.Key}'.",
-                        $"$.amendments[{idx}].replaces"));
+                    conflictedVersions.Add(link.FromVersionId);
+                    conflictedVersions.Add(link.ToVersionId);
+                }
+                if (chain.HasFork)
+                {
+                    foreach (var cid in chain.CandidateVersionIds)
+                    {
+                        conflictedVersions.Add(cid);
+                    }
+                }
+                continue;
+            }
+
+            if (chain.EffectiveVersionId is not null)
+            {
+                var visited = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var link in chain.Links)
+                {
+                    if (visited.Add(link.FromVersionId))
+                    {
+                        finalVersion[link.FromVersionId] = chain.EffectiveVersionId;
+                    }
+                }
+                finalVersion[chain.RootClauseId] = chain.EffectiveVersionId;
+                if (visited.Add(chain.EffectiveVersionId))
+                {
+                    finalVersion[chain.EffectiveVersionId] = chain.EffectiveVersionId;
                 }
             }
         }
 
-        var firstSuccessor = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var kvp in targetSuccessors)
-        {
-            var min = kvp.Value[0];
-            foreach (var idx in kvp.Value)
-            {
-                if (idx < min)
-                {
-                    min = idx;
-                }
-            }
-            firstSuccessor[kvp.Key] = min;
-        }
-
-        var successorVersion = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var kvp in firstSuccessor)
-        {
-            successorVersion[kvp.Key] = p.Amendments[kvp.Value].NewClauseId!;
-        }
-
-        var versionValues = BuildVersionValues(
-            p, active, clauseIds, activeNewIds, targetSuccessors, newIdOwner, issues);
+        var activeNewIds = graph.ActiveNewIds;
 
         BuildReferenceGraph(p, clauseIds, activeNewIds, out var nodeIndex,
             out var nodeId, out var adjacency, out var edgeEvidence, issues);
         DetectReferenceCycles(nodeIndex.Count, adjacency, edgeEvidence, nodeId, p, issues);
 
-        CheckAmountsAndDates(p, versionValues, successorVersion, issues);
+        CheckAmountsAndDates(p, versionValues, finalVersion, conflictedVersions, issues);
 
         CheckSignatures(p, partyIds, partyOrder, clauseIds, amendmentById, active,
-            activeNewIds, targetSuccessors, versionValues, issues);
+            activeNewIds, versionValues, issues);
 
         issues.Sort(CompareIssues);
 
-        var effective = BuildEffectiveObligations(p, successorVersion, versionValues);
+        var effective = BuildEffectiveObligations(p, chains, versionValues, finalVersion, conflictedVersions);
         var hasErrors = issues.Exists(i => i.Severity == Severity.Error);
 
         return new AuditResult
@@ -505,6 +545,7 @@ public static class AgreementAuditor
             AgreementId = p.AgreementId ?? string.Empty,
             Issues = issues,
             EffectiveObligations = effective,
+            VersionChains = chains,
             HasErrors = hasErrors
         };
     }
@@ -616,6 +657,32 @@ public static class AgreementAuditor
         return withdrawn;
     }
 
+    private sealed class VersionEdge
+    {
+        public int AmendmentIndex { get; init; }
+        public string AmendmentId { get; init; } = string.Empty;
+        public string From { get; init; } = string.Empty;
+        public string To { get; init; } = string.Empty;
+        public long? AmountFen { get; init; }
+        public DateOnly? Due { get; init; }
+        public string ReplacesEvidencePath { get; init; } = string.Empty;
+        public string NewClauseIdEvidencePath { get; init; } = string.Empty;
+        public string AmountEvidencePath { get; init; } = string.Empty;
+        public string DueEvidencePath { get; init; } = string.Empty;
+    }
+
+    private sealed class VersionGraph
+    {
+        public List<VersionEdge> Edges { get; } = new();
+        public Dictionary<string, List<VersionEdge>> OutEdges { get; } =
+            new(StringComparer.Ordinal);
+        public HashSet<string> ActiveNewIds { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> ForkNodes { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> CycleNodes { get; } = new(StringComparer.Ordinal);
+        public List<(string ForkedId, VersionEdge FirstEdge, List<VersionEdge> AllEdges)> Forks { get; } = new();
+        public List<VersionEdge> CycleBackEdges { get; } = new();
+    }
+
     private sealed class VersionValue
     {
         public long? AmountFen { get; init; }
@@ -625,17 +692,246 @@ public static class AgreementAuditor
         public string OriginalClauseId { get; init; } = string.Empty;
     }
 
-    private static Dictionary<string, VersionValue> BuildVersionValues(
+    private static VersionGraph BuildVersionGraph(
         AgreementPackage p,
         bool[] active,
         HashSet<string> clauseIds,
-        HashSet<string> activeNewIds,
-        Dictionary<string, List<int>> targetSuccessors,
-        Dictionary<string, int> newIdOwner,
+        List<Issue> issues)
+    {
+        var graph = new VersionGraph();
+        var n = p.Amendments.Count;
+
+        var newIdOwner = new Dictionary<string, int>(StringComparer.Ordinal);
+        var pendingEdges = new List<VersionEdge>();
+
+        for (var i = 0; i < n; i++)
+        {
+            if (!active[i])
+            {
+                continue;
+            }
+
+            var a = p.Amendments[i];
+            var newId = a.NewClauseId!;
+
+            if (clauseIds.Contains(newId) || !newIdOwner.TryAdd(newId, i))
+            {
+                issues.Add(new Issue(IssueCodes.AmendmentNewIdCollision, Severity.Error,
+                    $"Amendment '{a.Id}' newClauseId '{newId}' collides with an existing identifier.",
+                    $"$.amendments[{i}].newClauseId"));
+            }
+            graph.ActiveNewIds.Add(newId);
+
+            DateOnly? amdDue = null;
+            if (a.Due is not null)
+            {
+                if (TryParseDate(a.Due, out var dd))
+                {
+                    amdDue = dd;
+                }
+                else
+                {
+                    issues.Add(new Issue(IssueCodes.DateInvalid, Severity.Error,
+                        $"Amendment '{a.Id}' due date '{a.Due}' is not a valid yyyy-MM-dd date.",
+                        $"$.amendments[{i}].due"));
+                }
+            }
+            if (a.AmountFen is < 0)
+            {
+                issues.Add(new Issue(IssueCodes.AmountNegative, Severity.Error,
+                    $"Amendment '{a.Id}' amount is negative.",
+                    $"$.amendments[{i}].amountFen"));
+            }
+
+            var edge = new VersionEdge
+            {
+                AmendmentIndex = i,
+                AmendmentId = a.Id,
+                From = a.Replaces!,
+                To = newId,
+                AmountFen = a.AmountFen,
+                Due = amdDue,
+                ReplacesEvidencePath = $"$.amendments[{i}].replaces",
+                NewClauseIdEvidencePath = $"$.amendments[{i}].newClauseId",
+                AmountEvidencePath = a.AmountFen.HasValue ? $"$.amendments[{i}].amountFen" : string.Empty,
+                DueEvidencePath = amdDue.HasValue ? $"$.amendments[{i}].due" : string.Empty
+            };
+            pendingEdges.Add(edge);
+        }
+
+        pendingEdges.Sort((x, y) =>
+            string.CompareOrdinal(x.AmendmentId, y.AmendmentId));
+
+        foreach (var edge in pendingEdges)
+        {
+            graph.Edges.Add(edge);
+            if (!graph.OutEdges.TryGetValue(edge.From, out var list))
+            {
+                list = new List<VersionEdge>();
+                graph.OutEdges[edge.From] = list;
+            }
+            list.Add(edge);
+        }
+
+        foreach (var edge in pendingEdges)
+        {
+            var targetIsOriginal = clauseIds.Contains(edge.From);
+            var targetIsVersion = graph.ActiveNewIds.Contains(edge.From);
+            if (!targetIsOriginal && !targetIsVersion)
+            {
+                issues.Add(new Issue(IssueCodes.AmendmentTargetMissing, Severity.Error,
+                    $"Amendment '{edge.AmendmentId}' replaces unknown clause or version '{edge.From}'.",
+                    edge.ReplacesEvidencePath));
+            }
+        }
+
+        foreach (var kvp in graph.OutEdges)
+        {
+            if (kvp.Value.Count > 1)
+            {
+                graph.ForkNodes.Add(kvp.Key);
+                graph.Forks.Add((kvp.Key, kvp.Value[0], kvp.Value));
+                var competitors = string.Join(", ", kvp.Value.ConvertAll(e => $"'{e.AmendmentId}'"));
+                issues.Add(new Issue(IssueCodes.AmendmentAmbiguous, Severity.Error,
+                    $"Version '{kvp.Key}' is replaced by {kvp.Value.Count} concurrent amendments ({competitors}); the replacement chain is forked.",
+                    kvp.Value[0].ReplacesEvidencePath));
+            }
+        }
+
+        DetectReplacementCycles(graph, issues);
+
+        return graph;
+    }
+
+    private static void DetectReplacementCycles(VersionGraph graph, List<Issue> issues)
+    {
+        var nodes = new List<string>();
+        var nodeIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var edge in graph.Edges)
+        {
+            if (nodeIndex.TryAdd(edge.From, nodes.Count))
+            {
+                nodes.Add(edge.From);
+            }
+            if (nodeIndex.TryAdd(edge.To, nodes.Count))
+            {
+                nodes.Add(edge.To);
+            }
+        }
+
+        nodes.Sort(StringComparer.Ordinal);
+        nodeIndex.Clear();
+        for (var i = 0; i < nodes.Count; i++)
+        {
+            nodeIndex[nodes[i]] = i;
+        }
+
+        var count = nodes.Count;
+        var adj = new List<int>[count];
+        var adjEdge = new List<VersionEdge>[count];
+        for (var i = 0; i < count; i++)
+        {
+            adj[i] = new List<int>();
+            adjEdge[i] = new List<VersionEdge>();
+        }
+        foreach (var edge in graph.Edges)
+        {
+            if (nodeIndex.TryGetValue(edge.From, out var u) &&
+                nodeIndex.TryGetValue(edge.To, out var v))
+            {
+                adj[u].Add(v);
+                adjEdge[u].Add(edge);
+            }
+        }
+        for (var i = 0; i < count; i++)
+        {
+            adj[i].Sort((a, b) => string.CompareOrdinal(nodes[a], nodes[b]));
+            adjEdge[i].Sort((x, y) => string.CompareOrdinal(x.AmendmentId, y.AmendmentId));
+        }
+
+        var color = new int[count];
+        var stackNode = new Stack<int>();
+        var stackEdgeIdx = new Stack<int>();
+
+        for (var start = 0; start < count; start++)
+        {
+            if (color[start] != 0)
+            {
+                continue;
+            }
+
+            stackNode.Clear();
+            stackEdgeIdx.Clear();
+            stackNode.Push(start);
+            stackEdgeIdx.Push(0);
+            color[start] = 1;
+
+            while (stackNode.Count > 0)
+            {
+                var u = stackNode.Peek();
+                var idx = stackEdgeIdx.Pop();
+
+                if (idx < adj[u].Count)
+                {
+                    stackEdgeIdx.Push(idx + 1);
+                    var v = adj[u][idx];
+                    if (color[v] == 0)
+                    {
+                        color[v] = 1;
+                        stackNode.Push(v);
+                        stackEdgeIdx.Push(0);
+                    }
+                    else if (color[v] == 1)
+                    {
+                        var backEdge = adjEdge[u][idx];
+                        graph.CycleBackEdges.Add(backEdge);
+                        var cyclePath = BuildCyclePath(stackNode, v, nodes);
+                        issues.Add(new Issue(IssueCodes.AmendmentAmbiguous, Severity.Error,
+                            $"Replacement cycle detected: {cyclePath}.",
+                            backEdge.ReplacesEvidencePath));
+
+                        var arr = stackNode.ToArray();
+                        var inCycle = false;
+                        for (var k = arr.Length - 1; k >= 0; k--)
+                        {
+                            if (arr[k] == v)
+                            {
+                                inCycle = true;
+                            }
+                            if (inCycle)
+                            {
+                                graph.CycleNodes.Add(nodes[arr[k]]);
+                                color[arr[k]] = 2;
+                            }
+                        }
+                        while (stackNode.Count > 0 && stackNode.Peek() != v)
+                        {
+                            stackNode.Pop();
+                            stackEdgeIdx.Pop();
+                        }
+                        if (stackNode.Count > 0)
+                        {
+                            stackNode.Pop();
+                            stackEdgeIdx.Pop();
+                        }
+                    }
+                }
+                else
+                {
+                    color[u] = 2;
+                    stackNode.Pop();
+                }
+            }
+        }
+    }
+
+    private static Dictionary<string, VersionValue> BuildAllVersionValues(
+        AgreementPackage p,
+        VersionGraph graph,
+        HashSet<string> clauseIds,
         List<Issue> issues)
     {
         var values = new Dictionary<string, VersionValue>(StringComparer.Ordinal);
-        var n = p.Amendments.Count;
 
         for (var i = 0; i < p.Clauses.Count; i++)
         {
@@ -664,131 +960,227 @@ public static class AgreementAuditor
             };
         }
 
-        var predecessor = new int?[n];
-        var inDegree = new int[n];
-        for (var i = 0; i < n; i++)
+        var queue = new Queue<string>();
+        var enqueued = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < p.Clauses.Count; i++)
         {
-            if (!active[i])
+            if (values.ContainsKey(p.Clauses[i].Id) && enqueued.Add(p.Clauses[i].Id))
+            {
+                queue.Enqueue(p.Clauses[i].Id);
+            }
+        }
+
+        while (queue.Count > 0)
+        {
+            var cur = queue.Dequeue();
+            if (!graph.OutEdges.TryGetValue(cur, out var edges))
             {
                 continue;
             }
-            var target = p.Amendments[i].Replaces!;
-            if (activeNewIds.Contains(target) && newIdOwner.TryGetValue(target, out var owner))
-            {
-                predecessor[i] = owner;
-                inDegree[i] = 1;
-            }
-        }
 
-        var pq = new PriorityQueue<int, int>();
-        for (var i = 0; i < n; i++)
-        {
-            if (active[i] && inDegree[i] == 0)
-            {
-                pq.Enqueue(i, i);
-            }
-        }
-
-        var processed = new bool[n];
-        while (pq.TryDequeue(out var i, out _))
-        {
-            if (processed[i])
+            if (!values.TryGetValue(cur, out var srcValue))
             {
                 continue;
             }
-            processed[i] = true;
 
-            var a = p.Amendments[i];
-
-            if (a.AmountFen is < 0)
+            foreach (var edge in edges)
             {
-                issues.Add(new Issue(IssueCodes.AmountNegative, Severity.Error,
-                    $"Amendment '{a.Id}' amount is negative.",
-                    $"$.amendments[{i}].amountFen"));
-            }
-            DateOnly? amdDue = null;
-            if (a.Due is not null)
-            {
-                if (TryParseDate(a.Due, out var dd))
+                if (values.ContainsKey(edge.To))
                 {
-                    amdDue = dd;
+                    continue;
                 }
-                else
+
+                long? amount = edge.AmountFen ?? srcValue.AmountFen;
+                string amountEv = edge.AmountEvidencePath.Length > 0
+                    ? edge.AmountEvidencePath
+                    : srcValue.AmountEvidencePath;
+
+                DateOnly? due = edge.Due ?? srcValue.Due;
+                string dueEv = edge.DueEvidencePath.Length > 0
+                    ? edge.DueEvidencePath
+                    : srcValue.DueEvidencePath;
+
+                values[edge.To] = new VersionValue
                 {
-                    issues.Add(new Issue(IssueCodes.DateInvalid, Severity.Error,
-                        $"Amendment '{a.Id}' due date '{a.Due}' is not a valid yyyy-MM-dd date.",
-                        $"$.amendments[{i}].due"));
-                }
-            }
+                    AmountFen = amount,
+                    Due = due,
+                    AmountEvidencePath = amountEv,
+                    DueEvidencePath = dueEv,
+                    OriginalClauseId = srcValue.OriginalClauseId
+                };
 
-            var target = a.Replaces!;
-            values.TryGetValue(target, out var targetValue);
-
-            long? amount;
-            string amountEv;
-            if (a.AmountFen.HasValue)
-            {
-                amount = a.AmountFen;
-                amountEv = $"$.amendments[{i}].amountFen";
-            }
-            else
-            {
-                amount = targetValue?.AmountFen;
-                amountEv = targetValue?.AmountEvidencePath ?? string.Empty;
-            }
-
-            DateOnly? due;
-            string dueEv;
-            if (amdDue.HasValue)
-            {
-                due = amdDue;
-                dueEv = $"$.amendments[{i}].due";
-            }
-            else
-            {
-                due = targetValue?.Due;
-                dueEv = targetValue?.DueEvidencePath ?? string.Empty;
-            }
-
-            var originalClauseId = targetValue?.OriginalClauseId
-                ?? (clauseIds.Contains(target) ? target : string.Empty);
-
-            values[a.NewClauseId!] = new VersionValue
-            {
-                AmountFen = amount,
-                Due = due,
-                AmountEvidencePath = amountEv,
-                DueEvidencePath = dueEv,
-                OriginalClauseId = originalClauseId
-            };
-
-            if (targetSuccessors.TryGetValue(a.NewClauseId!, out var successors))
-            {
-                foreach (var s in successors)
+                if (enqueued.Add(edge.To))
                 {
-                    if (active[s])
-                    {
-                        inDegree[s]--;
-                        if (inDegree[s] == 0)
-                        {
-                            pq.Enqueue(s, s);
-                        }
-                    }
+                    queue.Enqueue(edge.To);
                 }
-            }
-        }
-
-        for (var i = 0; i < n; i++)
-        {
-            if (active[i] && !processed[i])
-            {
-                issues.Add(new Issue(IssueCodes.AmendmentAmbiguous, Severity.Error,
-                    $"Amendment '{p.Amendments[i].Id}' participates in a replacement chain cycle.",
-                    $"$.amendments[{i}].replaces"));
             }
         }
 
         return values;
+    }
+
+    private static List<ClauseVersionChain> BuildVersionChains(
+        AgreementPackage p,
+        VersionGraph graph,
+        Dictionary<string, VersionValue> values,
+        List<Issue> issues)
+    {
+        var chains = new List<ClauseVersionChain>();
+        var conflictByRoot = new Dictionary<string, (bool Fork, bool Cycle, string? Evidence, List<string> Candidates)>(
+            StringComparer.Ordinal);
+
+        foreach (var fork in graph.Forks)
+        {
+            var root = FindRootForVersion(fork.ForkedId, graph, values);
+            if (root is null)
+            {
+                continue;
+            }
+            var candidates = new List<string>();
+            foreach (var e in fork.AllEdges)
+            {
+                var leaf = FollowToLeaf(e.To, graph);
+                if (!candidates.Contains(leaf))
+                {
+                    candidates.Add(leaf);
+                }
+            }
+            candidates.Sort(StringComparer.Ordinal);
+
+            if (!conflictByRoot.TryGetValue(root, out var existing))
+            {
+                conflictByRoot[root] = (true, false, fork.FirstEdge.ReplacesEvidencePath, candidates);
+            }
+            else
+            {
+                var mergedCandidates = new HashSet<string>(existing.Candidates, StringComparer.Ordinal);
+                foreach (var c in candidates)
+                {
+                    mergedCandidates.Add(c);
+                }
+                var sorted = mergedCandidates.ToList();
+                sorted.Sort(StringComparer.Ordinal);
+                conflictByRoot[root] = (true, existing.Cycle,
+                    existing.Evidence is null ? fork.FirstEdge.ReplacesEvidencePath : existing.Evidence,
+                    sorted);
+            }
+        }
+
+        foreach (var backEdge in graph.CycleBackEdges)
+        {
+            var root = FindRootForVersion(backEdge.From, graph, values);
+            if (root is null)
+            {
+                root = FindRootForVersion(backEdge.To, graph, values);
+            }
+            if (root is null)
+            {
+                continue;
+            }
+            if (!conflictByRoot.TryGetValue(root, out var existing))
+            {
+                conflictByRoot[root] = (false, true, backEdge.ReplacesEvidencePath, new List<string>());
+            }
+            else if (!existing.Cycle)
+            {
+                conflictByRoot[root] = (existing.Fork, true,
+                    existing.Evidence ?? backEdge.ReplacesEvidencePath, existing.Candidates);
+            }
+        }
+
+        for (var i = 0; i < p.Clauses.Count; i++)
+        {
+            var rootId = p.Clauses[i].Id;
+            var rootPath = $"$.clauses[{i}].id";
+
+            var links = new List<VersionLink>();
+            var visited = new HashSet<string>(StringComparer.Ordinal) { rootId };
+            var cur = rootId;
+            var conflicted = conflictByRoot.TryGetValue(rootId, out var conflict);
+            var hitCycle = false;
+
+            while (graph.OutEdges.TryGetValue(cur, out var outList) && outList.Count > 0)
+            {
+                if (outList.Count != 1)
+                {
+                    break;
+                }
+                var edge = outList[0];
+                links.Add(new VersionLink
+                {
+                    AmendmentId = edge.AmendmentId,
+                    FromVersionId = edge.From,
+                    ToVersionId = edge.To,
+                    AmountFen = edge.AmountFen,
+                    Due = edge.Due,
+                    ReplacesEvidencePath = edge.ReplacesEvidencePath,
+                    NewClauseIdEvidencePath = edge.NewClauseIdEvidencePath
+                });
+                if (!visited.Add(edge.To))
+                {
+                    hitCycle = true;
+                    break;
+                }
+                cur = edge.To;
+            }
+
+            string? effective = null;
+            if (!conflicted && !hitCycle && links.Count > 0)
+            {
+                effective = cur;
+            }
+            else if (!conflicted && !hitCycle && links.Count == 0)
+            {
+                effective = rootId;
+            }
+
+            if (conflicted && conflict.Cycle && links.Count == 0 && graph.CycleNodes.Contains(rootId))
+            {
+                hitCycle = true;
+            }
+
+            chains.Add(new ClauseVersionChain
+            {
+                RootClauseId = rootId,
+                RootEvidencePath = rootPath,
+                Links = links,
+                EffectiveVersionId = effective,
+                HasFork = conflicted && conflict.Fork,
+                HasCycle = (conflicted && conflict.Cycle) || hitCycle,
+                CandidateVersionIds = conflicted ? conflict.Candidates : Array.Empty<string>(),
+                ConflictEvidencePath = conflicted ? conflict.Evidence : null
+            });
+        }
+
+        return chains;
+    }
+
+    private static string? FindRootForVersion(
+        string versionId,
+        VersionGraph graph,
+        Dictionary<string, VersionValue> values)
+    {
+        if (values.TryGetValue(versionId, out var v) && v.OriginalClauseId.Length > 0)
+        {
+            return v.OriginalClauseId;
+        }
+        return null;
+    }
+
+    private static string FollowToLeaf(string start, VersionGraph graph)
+    {
+        var cur = start;
+        var visited = new HashSet<string>(StringComparer.Ordinal) { start };
+        while (graph.OutEdges.TryGetValue(cur, out var edges) && edges.Count == 1)
+        {
+            var next = edges[0].To;
+            if (!visited.Add(next))
+            {
+                break;
+            }
+            cur = next;
+        }
+        return cur;
     }
 
     private static void BuildReferenceGraph(
@@ -950,13 +1342,18 @@ public static class AgreementAuditor
     private static void CheckAmountsAndDates(
         AgreementPackage p,
         Dictionary<string, VersionValue> values,
-        Dictionary<string, string> successorVersion,
+        Dictionary<string, string> finalVersion,
+        HashSet<string> conflictedVersions,
         List<Issue> issues)
     {
         for (var i = 0; i < p.Clauses.Count; i++)
         {
             var c = p.Clauses[i];
-            var selfFinal = ResolveFinal(c.Id, values, successorVersion);
+            if (conflictedVersions.Contains(c.Id))
+            {
+                continue;
+            }
+            var selfFinal = ResolveFinal(c.Id, values, finalVersion, conflictedVersions);
             if (selfFinal is null)
             {
                 continue;
@@ -970,7 +1367,13 @@ public static class AgreementAuditor
 
             foreach (var refId in c.References)
             {
-                var resolved = ResolveFinal(refId, values, successorVersion);
+                if (conflictedVersions.Contains(refId))
+                {
+                    allAmountsKnown = false;
+                    allDatesKnown = false;
+                    continue;
+                }
+                var resolved = ResolveFinal(refId, values, finalVersion, conflictedVersions);
                 if (resolved is null)
                 {
                     allAmountsKnown = false;
@@ -1029,25 +1432,24 @@ public static class AgreementAuditor
     private static (string VersionId, VersionValue Value)? ResolveFinal(
         string id,
         Dictionary<string, VersionValue> values,
-        Dictionary<string, string> successorVersion)
+        Dictionary<string, string> finalVersion,
+        HashSet<string> conflictedVersions)
     {
-        if (!values.TryGetValue(id, out var current))
+        if (conflictedVersions.Contains(id))
         {
             return null;
         }
-
-        var visited = new HashSet<string>(StringComparer.Ordinal) { id };
-        var curId = id;
-        while (successorVersion.TryGetValue(curId, out var nextId))
+        if (finalVersion.TryGetValue(id, out var finalId))
         {
-            if (!visited.Add(nextId) || !values.TryGetValue(nextId, out var next))
+            if (conflictedVersions.Contains(finalId))
             {
-                return (curId, current);
+                return null;
             }
-            curId = nextId;
-            current = next;
+            return values.TryGetValue(finalId, out var fv)
+                ? (finalId, fv)
+                : null;
         }
-        return (curId, current);
+        return values.TryGetValue(id, out var v) ? (id, v) : null;
     }
 
     private static void CheckSignatures(
@@ -1058,7 +1460,6 @@ public static class AgreementAuditor
         Dictionary<string, int> amendmentById,
         bool[] active,
         HashSet<string> activeNewIds,
-        Dictionary<string, List<int>> targetSuccessors,
         Dictionary<string, VersionValue> values,
         List<Issue> issues)
     {
@@ -1135,8 +1536,8 @@ public static class AgreementAuditor
             }
 
             var a = p.Amendments[i];
-            var rootId = FindOriginalClauseId(a.Replaces!, values, clauseIds, activeNewIds);
-            if (rootId is null || !values.TryGetValue(rootId, out var rootValue))
+            var rootId = FindOriginalClauseId(a.Replaces!, values, clauseIds);
+            if (rootId is null)
             {
                 continue;
             }
@@ -1159,8 +1560,7 @@ public static class AgreementAuditor
     private static string? FindOriginalClauseId(
         string target,
         Dictionary<string, VersionValue> values,
-        HashSet<string> clauseIds,
-        HashSet<string> activeNewIds)
+        HashSet<string> clauseIds)
     {
         if (clauseIds.Contains(target))
         {
@@ -1187,14 +1587,20 @@ public static class AgreementAuditor
 
     private static Dictionary<string, Obligation> BuildEffectiveObligations(
         AgreementPackage p,
-        Dictionary<string, string> successorVersion,
-        Dictionary<string, VersionValue> values)
+        List<ClauseVersionChain> chains,
+        Dictionary<string, VersionValue> values,
+        Dictionary<string, string> finalVersion,
+        HashSet<string> conflictedVersions)
     {
         var result = new Dictionary<string, Obligation>(StringComparer.Ordinal);
         for (var i = 0; i < p.Clauses.Count; i++)
         {
             var c = p.Clauses[i];
-            var final = ResolveFinal(c.Id, values, successorVersion);
+            if (conflictedVersions.Contains(c.Id))
+            {
+                continue;
+            }
+            var final = ResolveFinal(c.Id, values, finalVersion, conflictedVersions);
             if (final is null)
             {
                 continue;
