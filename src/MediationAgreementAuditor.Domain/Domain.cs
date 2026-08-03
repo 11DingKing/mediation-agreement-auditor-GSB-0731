@@ -95,6 +95,9 @@ public sealed class Amendment
 /// </summary>
 public sealed class Signature
 {
+    /// <summary>Optional stable identifier of the signature event (for withdrawal targeting).</summary>
+    public string? Id { get; set; }
+
     /// <summary>Identifier of the signing party.</summary>
     public string PartyId { get; set; } = string.Empty;
 
@@ -103,6 +106,13 @@ public sealed class Signature
 
     /// <summary>ISO-8601 instant the signature was applied.</summary>
     public string? SignedAt { get; set; }
+
+    /// <summary>
+    /// Event sequence number used to order signatures sharing the same
+    /// <see cref="SignedAt"/>. Lower sequence numbers happened first.
+    /// When absent, the original JSON array position is used as the tiebreaker.
+    /// </summary>
+    public int? Seq { get; set; }
 }
 
 /// <summary>
@@ -174,6 +184,19 @@ public sealed class AuditResult
     /// </summary>
     public IReadOnlyList<ClauseVersionChain> VersionChains { get; init; } =
         Array.Empty<ClauseVersionChain>();
+
+    /// <summary>
+    /// <see langword="true"/> when the entire agreement has been withdrawn by an amendment.
+    /// When withdrawn, no effective obligations are resolved.
+    /// </summary>
+    public bool AgreementWithdrawn { get; init; }
+
+    /// <summary>
+    /// Identifiers of parties removed from the agreement by withdrawal amendments. Removed
+    /// parties' signatures are void and they are not required to sign.
+    /// </summary>
+    public IReadOnlySet<string> RemovedParties { get; init; } =
+        new HashSet<string>(StringComparer.Ordinal);
 
     /// <summary><see langword="true"/> when at least one error-severity issue exists.</summary>
     public bool HasErrors { get; init; }
@@ -295,6 +318,19 @@ public static class IssueCodes
 
     /// <summary>Amendment withdrawals form a directed cycle.</summary>
     public const string AmendmentWithdrawCycle = "MED_AMD_WITHDRAW_CYCLE";
+
+    /// <summary>The entire master agreement has been withdrawn by an amendment.</summary>
+    public const string AgreementWithdrawn = "MED_AGREEMENT_WITHDRAWN";
+
+    /// <summary>A party has been removed from the agreement by a withdrawal amendment.</summary>
+    public const string PartyRemoved = "MED_PARTY_REMOVED";
+
+    /// <summary>
+    /// An amendment attempts to withdraw an already-applied signature fact. Signatures are
+    /// immutable historical records; the original signature is preserved and this issue is
+    /// raised instead of tampering with history.
+    /// </summary>
+    public const string SignatureFactWithdraw = "MED_SIG_FACT_WITHDRAW";
 
     /// <summary>A signature belongs to a party that is not declared.</summary>
     public const string SignaturePartyUnknown = "MED_SIG_PARTY_UNKNOWN";
@@ -429,6 +465,21 @@ public static class AgreementAuditor
         var n = p.Amendments.Count;
         var withdrawEdge = new int?[n];
         var hasReplacement = new bool[n];
+        var agreementWithdrawn = false;
+        var removedParties = new HashSet<string>(StringComparer.Ordinal);
+        var agreementWithdrawEvidence = string.Empty;
+        var partyRemovedEvidence = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        var signatureById = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var i = 0; i < p.Signatures.Count; i++)
+        {
+            var sid = p.Signatures[i].Id;
+            if (!string.IsNullOrEmpty(sid))
+            {
+                signatureById.TryAdd(sid!, i);
+            }
+        }
+
         for (var i = 0; i < n; i++)
         {
             var a = p.Amendments[i];
@@ -439,7 +490,7 @@ public static class AgreementAuditor
             if (hasReplaces != hasNewId || (!hasReplaces && !hasWithdraws))
             {
                 issues.Add(new Issue(IssueCodes.AmendmentMalformed, Severity.Error,
-                    $"Amendment '{a.Id}' must either replace a clause (replaces + newClauseId) or withdraw an amendment.",
+                    $"Amendment '{a.Id}' must either replace a clause (replaces + newClauseId) or withdraw a target.",
                     $"$.amendments[{i}]"));
             }
             else
@@ -449,33 +500,63 @@ public static class AgreementAuditor
 
             if (hasWithdraws)
             {
-                if (amendmentById.TryGetValue(a.Withdraws!, out var target))
+                var target = a.Withdraws!;
+                var evidence = $"$.amendments[{i}].withdraws";
+
+                if (target == p.AgreementId)
                 {
-                    if (target == i)
+                    if (!agreementWithdrawn)
+                    {
+                        agreementWithdrawn = true;
+                        agreementWithdrawEvidence = evidence;
+                        issues.Add(new Issue(IssueCodes.AgreementWithdrawn, Severity.Error,
+                            $"Amendment '{a.Id}' withdraws the entire agreement '{target}'.",
+                            evidence));
+                    }
+                }
+                else if (partyIds.Contains(target))
+                {
+                    if (removedParties.Add(target))
+                    {
+                        partyRemovedEvidence[target] = evidence;
+                        issues.Add(new Issue(IssueCodes.PartyRemoved, Severity.Warning,
+                            $"Amendment '{a.Id}' removes party '{target}' from the agreement.",
+                            evidence));
+                    }
+                }
+                else if (signatureById.ContainsKey(target))
+                {
+                    issues.Add(new Issue(IssueCodes.SignatureFactWithdraw, Severity.Error,
+                        $"Amendment '{a.Id}' attempts to withdraw signature fact '{target}'. Signatures are immutable historical records; the original signature is preserved.",
+                        evidence));
+                }
+                else if (amendmentById.TryGetValue(target, out var amdIdx))
+                {
+                    if (amdIdx == i)
                     {
                         issues.Add(new Issue(IssueCodes.AmendmentWithdrawCycle, Severity.Error,
                             $"Amendment '{a.Id}' withdraws itself.",
-                            $"$.amendments[{i}].withdraws"));
+                            evidence));
                     }
                     else
                     {
-                        withdrawEdge[i] = target;
+                        withdrawEdge[i] = amdIdx;
                     }
                 }
                 else
                 {
                     issues.Add(new Issue(IssueCodes.AmendmentWithdrawUnknown, Severity.Error,
-                        $"Amendment '{a.Id}' withdraws unknown amendment '{a.Withdraws}'.",
-                        $"$.amendments[{i}].withdraws"));
+                        $"Amendment '{a.Id}' withdraws unknown target '{target}'.",
+                        evidence));
                 }
             }
         }
 
-        var withdrawn = ResolveWithdrawnAmendments(n, withdrawEdge, issues, p);
+        var withdrawnAmendments = ResolveWithdrawnAmendments(n, withdrawEdge, issues, p);
         var active = new bool[n];
         for (var i = 0; i < n; i++)
         {
-            active[i] = hasReplacement[i] && !withdrawn[i];
+            active[i] = hasReplacement[i] && !withdrawnAmendments[i] && !agreementWithdrawn;
         }
 
         var graph = BuildVersionGraph(p, active, clauseIds, issues);
@@ -530,14 +611,17 @@ public static class AgreementAuditor
             out var nodeId, out var adjacency, out var edgeEvidence, issues);
         DetectReferenceCycles(nodeIndex.Count, adjacency, edgeEvidence, nodeId, p, issues);
 
-        CheckAmountsAndDates(p, versionValues, finalVersion, conflictedVersions, issues);
+        CheckAmountsAndDates(p, versionValues, finalVersion, conflictedVersions,
+            agreementWithdrawn, issues);
 
         CheckSignatures(p, partyIds, partyOrder, clauseIds, amendmentById, active,
-            activeNewIds, versionValues, issues);
+            activeNewIds, versionValues, removedParties, agreementWithdrawn, issues);
 
         issues.Sort(CompareIssues);
 
-        var effective = BuildEffectiveObligations(p, chains, versionValues, finalVersion, conflictedVersions);
+        var effective = agreementWithdrawn
+            ? new Dictionary<string, Obligation>(StringComparer.Ordinal)
+            : BuildEffectiveObligations(p, chains, versionValues, finalVersion, conflictedVersions, removedParties);
         var hasErrors = issues.Exists(i => i.Severity == Severity.Error);
 
         return new AuditResult
@@ -546,6 +630,8 @@ public static class AgreementAuditor
             Issues = issues,
             EffectiveObligations = effective,
             VersionChains = chains,
+            AgreementWithdrawn = agreementWithdrawn,
+            RemovedParties = removedParties,
             HasErrors = hasErrors
         };
     }
@@ -1344,8 +1430,13 @@ public static class AgreementAuditor
         Dictionary<string, VersionValue> values,
         Dictionary<string, string> finalVersion,
         HashSet<string> conflictedVersions,
+        bool agreementWithdrawn,
         List<Issue> issues)
     {
+        if (agreementWithdrawn)
+        {
+            return;
+        }
         for (var i = 0; i < p.Clauses.Count; i++)
         {
             var c = p.Clauses[i];
@@ -1461,26 +1552,42 @@ public static class AgreementAuditor
         bool[] active,
         HashSet<string> activeNewIds,
         Dictionary<string, VersionValue> values,
+        HashSet<string> removedParties,
+        bool agreementWithdrawn,
         List<Issue> issues)
     {
-        var partySignsAgreement = new HashSet<string>(StringComparer.Ordinal);
-        var partySignsAmendment = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
-
+        var ordered = new List<(int Index, Signature Sig, string SortKey)>();
         for (var i = 0; i < p.Signatures.Count; i++)
         {
             var s = p.Signatures[i];
+            var ts = s.SignedAt ?? string.Empty;
+            var seq = s.Seq ?? i;
+            var sortKey = $"{ts}|{seq:D10}|{i:D10}";
+            ordered.Add((i, s, sortKey));
+        }
+        ordered.Sort((a, b) => string.CompareOrdinal(a.SortKey, b.SortKey));
+
+        var partySignsAgreement = new HashSet<string>(StringComparer.Ordinal);
+        var partySignsAmendment = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+
+        foreach (var (arrayIdx, s, _) in ordered)
+        {
             var pid = s.PartyId ?? string.Empty;
+            if (removedParties.Contains(pid))
+            {
+                continue;
+            }
             if (!partyIds.Contains(pid))
             {
                 issues.Add(new Issue(IssueCodes.SignaturePartyUnknown, Severity.Error,
                     $"Signature belongs to unknown party '{pid}'.",
-                    $"$.signatures[{i}].partyId"));
+                    $"$.signatures[{arrayIdx}].partyId"));
             }
 
             for (var j = 0; j < s.Scope.Count; j++)
             {
                 var sc = s.Scope[j] ?? string.Empty;
-                var path = $"$.signatures[{i}].scope[{j}]";
+                var path = $"$.signatures[{arrayIdx}].scope[{j}]";
                 if (sc == p.AgreementId)
                 {
                     if (pid.Length > 0)
@@ -1520,12 +1627,21 @@ public static class AgreementAuditor
         for (var i = 0; i < p.Parties.Count; i++)
         {
             var pid = p.Parties[i].Id;
+            if (removedParties.Contains(pid))
+            {
+                continue;
+            }
             if (!partySignsAgreement.Contains(pid))
             {
                 issues.Add(new Issue(IssueCodes.SignatureMissing, Severity.Error,
                     $"Party '{pid}' has not signed the agreement.",
                     $"$.parties[{i}].id"));
             }
+        }
+
+        if (agreementWithdrawn)
+        {
+            return;
         }
 
         for (var i = 0; i < p.Amendments.Count; i++)
@@ -1543,7 +1659,7 @@ public static class AgreementAuditor
             }
 
             var obligor = FindObligor(rootId, p);
-            if (obligor is null || !partyIds.Contains(obligor))
+            if (obligor is null || !partyIds.Contains(obligor) || removedParties.Contains(obligor))
             {
                 continue;
             }
@@ -1590,13 +1706,18 @@ public static class AgreementAuditor
         List<ClauseVersionChain> chains,
         Dictionary<string, VersionValue> values,
         Dictionary<string, string> finalVersion,
-        HashSet<string> conflictedVersions)
+        HashSet<string> conflictedVersions,
+        HashSet<string> removedParties)
     {
         var result = new Dictionary<string, Obligation>(StringComparer.Ordinal);
         for (var i = 0; i < p.Clauses.Count; i++)
         {
             var c = p.Clauses[i];
             if (conflictedVersions.Contains(c.Id))
+            {
+                continue;
+            }
+            if (removedParties.Contains(c.Obligor))
             {
                 continue;
             }
